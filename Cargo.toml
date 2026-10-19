@@ -13,8 +13,9 @@ members = ["engine"]
 rpi-llm-engine = { path = "engine" }
 # The chip feature selects the SoC's peripheral memory map. None is a
 # default, because there is no sensible default chip; this one is for the
-# Raspberry Pi 5 (preliminary).
-rpi-hal = { version = "0.10", features = ["bcm2712"] }
+# Raspberry Pi 5 (preliminary). `multicore` starts cores 1-3, which on the
+# Pi 5 the firmware does through PSCI.
+rpi-hal = { version = "0.10", features = ["bcm2712", "multicore"] }
 # The bring-up every board does: the console and `logln!`, the heap the
 # weights live on, and the card's FAT volume they are read from. Each
 # capability is a feature; see https://docs.rs/rpi-kickstart.
@@ -32,8 +33,8 @@ critical-section = "1.2"
 static_cell = "2.1"
 
 # TEMPORARY, until the next rpi-hal release: rpi-hal 0.10 does not build
-# `rpi_hal::mem` for the Pi 5, and rpi-kickstart's `heap` needs it. Remove
-# this once the release that does is out.
+# `rpi_hal::mem` for the Pi 5, which rpi-kickstart's `heap` needs, nor
+# `multicore`. Remove this once the release with both is out.
 [patch.crates-io]
 rpi-hal = { path = "../rpi-hal/hal" }
 

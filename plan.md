@@ -112,11 +112,18 @@ A serial terminal over the RP1 UART0 (GPIO14/15):
 
 ## Build order
 
-1. The parallel matrix multiply across all 4 cores. One core with NEON
-   `sdot` already runs SmolLM2 at 19.4 tok/s, reading about 7 GB/s of
-   weights, close to what the Pi 5's memory delivers in practice — so
-   expect well under 4x from four cores, and measure the bandwidth first.
-2. Fan control, then the side-by-side benchmark against llama.cpp on
+1. The parallel matrix multiply across all 4 cores. Measured
+   (`make bandwidth`): one core reads 14.0 GB/s, and more cores read
+   less in total (4 cores: 11.6 GB/s), so the memory ceiling for
+   generation is about 14 GB/s / 360 MB, roughly 32-39 tok/s. One core
+   with NEON `sdot` runs at 19.4 tok/s, reading only 7 GB/s: the rest of
+   each token is computation, which is what the other cores can share.
+   Expect up to about 1.6-2x on generation.
+2. Batched prompt processing: feed the prompt's tokens through each
+   matrix together, so one pass over the weights serves many tokens. That
+   makes the prompt compute-bound instead of memory-bound, where four
+   cores can scale.
+3. Fan control, then the side-by-side benchmark against llama.cpp on
    Raspberry Pi OS.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

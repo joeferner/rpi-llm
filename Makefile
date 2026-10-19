@@ -31,7 +31,7 @@ MODEL_URL_stories15M.bin := https://huggingface.co/karpathy/tinyllamas/resolve/m
 MODEL_URL_tokenizer.bin := https://raw.githubusercontent.com/karpathy/llama2.c/350e04f/tokenizer.bin
 MODEL_URL_smollm2-360m-instruct-q8_0.gguf := https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q8_0.gguf
 
-.PHONY: all build run test models sd-card clean
+.PHONY: all build run bandwidth test models sd-card clean
 
 # The host's own target, which `make test` builds the engine for:
 # `.cargo/config.toml` points plain `cargo` at the board.
@@ -46,6 +46,12 @@ build:
 
 run: build
 	rpi-loader --device $(DEVICE) boot --load-addr $(LOAD_ADDR) target/$(KERNEL)
+
+# The memory bandwidth measurement (examples/bandwidth.rs), on the board.
+bandwidth:
+	cargo build --release --example bandwidth
+	cargo objcopy --release --example bandwidth -- -O binary target/bandwidth.img
+	rpi-loader --device $(DEVICE) boot --load-addr $(LOAD_ADDR) target/bandwidth.img
 
 # The engine's tests, on this machine rather than the board. The one
 # that compares against llama2.c needs `make models` first, and skips
