@@ -4,13 +4,12 @@
 //! rpi-llm: a small language model on a bare-metal Raspberry Pi 5,
 //! chatting over the serial console.
 //!
-//! What runs today: the model and its tokenizer read off the SD card into
-//! RAM, with a progress line while they load, then checked — the
-//! checkpoint's size against what its header implies, the tokenizer parsed
-//! to its last byte, and a checksum of each to compare with the host's.
-//! Then one greedy generation on one core, streamed to the terminal, timed,
-//! and compared token for token with what llama2.c produced from the same
-//! prompt.
+//! What runs today: SmolLM2-360M-Instruct, a Q8_0 GGUF file, read off the
+//! SD card into RAM with a progress line while it loads, checked against
+//! the host's checksum, and parsed. Then one chat turn on one core — a
+//! fixed request, the model's ChatML template around it — answered
+//! greedily, streamed to the terminal, timed, and compared token for token
+//! with what the same engine produced on the host.
 
 extern crate alloc;
 
@@ -24,16 +23,34 @@ use rpi_hal::mailbox::{ClockId, Mailbox};
 use rpi_hal::sd::{Sd, SdBlockDevice};
 use rpi_hal::{halt, pac, timer::Timer, uart::Uart};
 use rpi_kickstart::{console, heap, logln, storage};
+use rpi_llm_engine::bpe::Bpe;
 use rpi_llm_engine::generate::Generation;
-use rpi_llm_engine::llama2;
+use rpi_llm_engine::gguf::Gguf;
 use rpi_llm_engine::model::{Transformer, Weights};
-use rpi_llm_engine::tokenizer::{Tokenizer, printable};
 use static_cell::StaticCell;
 
-/// The checkpoint, on the card.
-const MODEL: &str = "models/stories15M.bin";
-/// Its tokenizer, on the card.
-const TOKENIZER: &str = "models/tokenizer.bin";
+/// The model, on the card.
+const MODEL: &str = "models/smollm2-360m-instruct-q8_0.gguf";
+
+/// The model file's FNV-1a, computed on the host over the file `make
+/// models` fetches (its SHA-256 is in `models.sha256`).
+const MODEL_FNV1A: u64 = 0x25b4_dd6c_3e5d_a561;
+
+/// Positions the key/value cache holds. SmolLM2 was trained for 8192, but
+/// the cache costs 80 KiB a position; 2048 is 160 MiB.
+const CONTEXT: usize = 2048;
+
+/// The chat turn: the model's ChatML template around one request, the same
+/// prompt the engine's host tests use.
+const PROMPT: &str = include_str!("../engine/tests/data/smollm2_story.prompt");
+
+/// How many tokens the answer may run to.
+const ANSWER_TOKENS: usize = 200;
+
+/// What the engine generated from [`PROMPT`] on the host. The arithmetic is
+/// IEEE `f32` with nothing fused and the same `libm` on both machines, so
+/// the board has to produce exactly this.
+const REFERENCE: &str = include_str!("../engine/tests/data/smollm2_story.engine.ids");
 
 // The console borrows its sink for `'static`.
 static SINK: StaticCell<term::Sink> = StaticCell::new();
@@ -92,72 +109,46 @@ pub extern "C" fn kmain() -> ! {
         Err(e) => fail(format_args!("storage: {e:?}")),
     };
 
-    let (model, elapsed) = match load::load(&mut volume, MODEL, &timer) {
+    let (file, elapsed) = match load::load(&mut volume, MODEL, &timer) {
         Ok(loaded) => loaded,
         Err(e) => fail(format_args!("{MODEL}: {e:?}")),
     };
-    report_load(MODEL, model.bytes().len(), elapsed);
-    let config = match llama2::Config::parse(model.bytes()) {
-        Ok(config) => config,
+    report_load(MODEL, file.bytes().len(), elapsed);
+    report_checksum(MODEL, file.bytes(), &timer);
+
+    let gguf = match Gguf::parse(file.bytes()) {
+        Ok(gguf) => gguf,
+        Err(e) => fail(format_args!("{MODEL}: {e:?}")),
+    };
+    let bpe = match Bpe::from_gguf(&gguf) {
+        Ok(bpe) => bpe,
+        Err(e) => fail(format_args!("{MODEL}: tokenizer: {e:?}")),
+    };
+    let (config, weights) = match Weights::from_gguf(&gguf) {
+        Ok(model) => model,
         Err(e) => fail(format_args!("{MODEL}: {e:?}")),
     };
     logln!(
-        "model: dim {} hidden {} layers {} heads {} kv heads {} vocab {} context {}{}",
+        "model: {} layers, dim {}, hidden {}, {} heads / {} kv heads, vocab {}, rope base {}",
+        config.n_layers,
         config.dim,
         config.hidden_dim,
-        config.n_layers,
         config.n_heads,
         config.n_kv_heads,
         config.vocab_size,
-        config.seq_len,
-        if config.shared_classifier {
-            ", shared classifier"
-        } else {
-            ""
-        },
+        config.rope_theta,
     );
-    logln!(
-        "model: {} weights, the size the header implies",
-        config.weight_count()
-    );
-    report_checksum(MODEL, model.bytes(), &timer);
-
-    let (tokenizer, elapsed) = match load::load(&mut volume, TOKENIZER, &timer) {
-        Ok(loaded) => loaded,
-        Err(e) => fail(format_args!("{TOKENIZER}: {e:?}")),
-    };
-    report_load(TOKENIZER, tokenizer.bytes().len(), elapsed);
-    report_checksum(TOKENIZER, tokenizer.bytes(), &timer);
-    let tokenizer = match Tokenizer::new(tokenizer.bytes(), config.vocab_size) {
-        Ok(tokenizer) => tokenizer,
-        Err(e) => fail(format_args!("{TOKENIZER}: {e:?}")),
-    };
-    logln!("tokenizer: {} tokens", config.vocab_size);
-
-    let weights = match Weights::new(&config, model.bytes()) {
-        Ok(weights) => weights,
-        Err(e) => fail(format_args!("{MODEL}: {e:?}")),
-    };
-    let mut transformer = Transformer::new(config, weights);
+    let mut transformer = Transformer::new(config, weights, CONTEXT);
+    logln!("model: context {} positions", transformer.context());
 
     full_speed(&mut mailbox);
 
-    let ids = generate(&mut transformer, &tokenizer, PROMPT, &timer);
+    let ids = chat(&mut transformer, &bpe, &timer);
     check_against_reference(&ids);
 
     logln!("rpi-llm: done");
     halt();
 }
-
-/// What the model is asked to continue.
-const PROMPT: &str = "Once upon a time";
-
-/// Positions to run, prompt included: `run.c`'s `-n 256`.
-const STEPS: usize = 256;
-
-/// The tokens llama2.c's `run.c` produced for [`PROMPT`] greedily, the
-/// same reference the engine's host test checks against.
-const REFERENCE: &str = include_str!("../engine/tests/data/once_upon_a_time.ids");
 
 /// Raises the ARM to the fastest clock the firmware offers, and logs what
 /// it actually runs at.
@@ -186,78 +177,76 @@ fn full_speed(mailbox: &mut Mailbox) {
     }
 }
 
-/// Feeds `prompt` through the model and generates greedily from it,
-/// streaming the text to the terminal as each token arrives. Returns the
-/// tokens emitted, prompt tokens after `<s>` included, as `run.c` prints
-/// them.
-fn generate(
-    transformer: &mut Transformer,
-    tokenizer: &Tokenizer,
-    prompt: &str,
-    timer: &Timer,
-) -> Vec<u32> {
-    let mut generation = Generation::new(tokenizer.encode(prompt, true, false), STEPS);
-    logln!(
-        "generate: \"{prompt}\", {} prompt tokens, greedy, up to {STEPS} positions",
-        generation.prompt_len()
-    );
+/// Answers [`PROMPT`] greedily, streaming the answer to the terminal as
+/// each token arrives, and returns the answer's tokens.
+fn chat(transformer: &mut Transformer, bpe: &Bpe, timer: &Timer) -> Vec<u32> {
+    let prompt = bpe.encode(PROMPT);
+    let prompt_len = prompt.len();
+    // Positions, not tokens: the last prompt position already produces the
+    // first answer token.
+    let steps = prompt_len + ANSWER_TOKENS - 1;
+    let mut generation = Generation::new(prompt, steps, &[bpe.eos()]);
+    logln!("chat: {prompt_len} prompt tokens, greedy, up to {ANSWER_TOKENS} answer tokens");
+    term::write_bytes(PROMPT.as_bytes());
 
     let mut ids = Vec::new();
+    let mut piece = Vec::new();
     let started = timer.now_micros();
-    // When the first generated token arrived, and how many have since:
-    // the rate is over generated tokens only, as `run.c`'s is, so the
-    // prompt's forced tokens do not inflate it.
-    let mut first_generated: Option<u64> = None;
-    let mut generated = 0u32;
+    // When the first answer token arrived: the prompt's positions before it
+    // and the answer's after it are timed separately, since a chat's
+    // latency is the one and its speed the other.
+    let mut first: Option<u64> = None;
     while let Some(step) = generation.step(transformer) {
+        if !step.generated {
+            continue;
+        }
+        first.get_or_insert_with(|| timer.now_micros());
         ids.push(step.next);
-        let piece = tokenizer.decode(step.prev, step.next);
-        if printable(piece) {
-            term::write_bytes(piece);
-        }
-        if step.generated {
-            match first_generated {
-                None => first_generated = Some(timer.now_micros()),
-                Some(_) => generated += 1,
-            }
-        }
+        piece.clear();
+        bpe.decode(step.next, &mut piece);
+        term::write_bytes(&piece);
     }
     let ended = timer.now_micros();
     term::write_bytes(b"\n");
 
-    let total_s = (ended - started) as f32 / 1e6;
-    logln!("generate: {} tokens in {total_s:.2} s", ids.len());
-    if let Some(first) = first_generated
-        && generated > 0
-    {
-        let rate = generated as f32 / ((ended - first) as f32 / 1e6);
-        logln!("generate: {rate:.1} tok/s");
+    if let Some(first) = first {
+        let prompt_s = (first - started) as f32 / 1e6;
+        logln!(
+            "chat: prompt {prompt_len} tokens in {prompt_s:.2} s, {:.1} tok/s",
+            prompt_len as f32 / prompt_s
+        );
+        if ids.len() > 1 {
+            let answer_s = (ended - first) as f32 / 1e6;
+            logln!(
+                "chat: answer {} tokens in {answer_s:.2} s, {:.1} tok/s",
+                ids.len(),
+                (ids.len() - 1) as f32 / answer_s
+            );
+        }
     }
     ids
 }
 
-/// Logs whether `ids` is the token sequence llama2.c produced.
+/// Logs whether `ids` is the answer the engine produced on the host.
 fn check_against_reference(ids: &[u32]) {
-    let mut expected = REFERENCE.lines().map(|line| line.parse::<u32>().unwrap());
-    let mut count = 0;
-    for (i, &id) in ids.iter().enumerate() {
-        match expected.next() {
-            Some(want) if want == id => count += 1,
-            Some(want) => {
-                logln!("reference: token {i} differs: {id}, llama2.c has {want}");
-                return;
-            }
-            None => {
-                logln!("reference: {} tokens, llama2.c stopped at {i}", ids.len());
-                return;
-            }
+    let expected: Vec<u32> = REFERENCE
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    match ids.iter().zip(&expected).position(|(a, b)| a != b) {
+        Some(i) => logln!(
+            "reference: token {i} differs: {}, the host engine has {}",
+            ids[i],
+            expected[i]
+        ),
+        None if ids.len() == expected.len() => {
+            logln!("reference: all {} tokens match the host engine", ids.len());
         }
-    }
-    let remaining = expected.count();
-    if remaining == 0 {
-        logln!("reference: all {count} tokens match llama2.c");
-    } else {
-        logln!("reference: stopped {remaining} tokens before llama2.c did");
+        None => logln!(
+            "reference: {} tokens where the host engine has {}",
+            ids.len(),
+            expected.len()
+        ),
     }
 }
 
@@ -277,10 +266,16 @@ fn report_load(path: &str, bytes: usize, elapsed_us: u64) {
     );
 }
 
-/// Logs the FNV-1a checksum of a loaded file, and how long it took.
+/// Logs the FNV-1a checksum of a loaded file against the host's, and how
+/// long it took.
 fn report_checksum(path: &str, bytes: &[u8], timer: &Timer) {
     let started = timer.now_micros();
     let hash = load::fnv1a(bytes);
     let elapsed_ms = (timer.now_micros() - started) / 1000;
-    logln!("{path}: fnv1a {hash:016x} ({elapsed_ms} ms)");
+    let verdict = if hash == MODEL_FNV1A {
+        "matches the host"
+    } else {
+        "DIFFERS from the host"
+    };
+    logln!("{path}: fnv1a {hash:016x}, {verdict} ({elapsed_ms} ms)");
 }

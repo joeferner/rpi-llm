@@ -26,9 +26,10 @@ LOADER_URL := https://github.com/joeferner/rpi-hal/releases/download/loader-v0.6
 LOADER_IMAGE := rpi-loader-0.6.0-bcm2712-kernel8.img
 
 # What `make models` fetches, checked against models.sha256.
-MODEL_FILES := stories15M.bin tokenizer.bin
+MODEL_FILES := stories15M.bin tokenizer.bin smollm2-360m-instruct-q8_0.gguf
 MODEL_URL_stories15M.bin := https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
 MODEL_URL_tokenizer.bin := https://raw.githubusercontent.com/karpathy/llama2.c/350e04f/tokenizer.bin
+MODEL_URL_smollm2-360m-instruct-q8_0.gguf := https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q8_0.gguf
 
 .PHONY: all build run test models sd-card clean
 

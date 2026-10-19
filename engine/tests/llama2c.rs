@@ -15,56 +15,33 @@
 //! Needs the model files in the repository's `models/` directory
 //! (`make models` fetches them) and skips, saying so, without them.
 
-use std::path::PathBuf;
+mod common;
 
+use common::read_model_file;
 use rpi_llm_engine::generate::Generation;
 use rpi_llm_engine::llama2::Config;
 use rpi_llm_engine::model::{Transformer, Weights};
-use rpi_llm_engine::tokenizer::{Tokenizer, printable};
-
-/// The repository's `models/` directory.
-fn models() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models")
-}
-
-/// Reads `name` from `models/` into memory aligned for `f32`s, as the
-/// board's loader does; `None` if it is not there.
-fn read_model_file(name: &str) -> Option<(Vec<u32>, usize)> {
-    let bytes = std::fs::read(models().join(name)).ok()?;
-    let mut words = vec![0u32; bytes.len().div_ceil(4)];
-    // SAFETY: `words` has at least `bytes.len()` bytes, and `u32` has no
-    // invalid bit patterns.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast(), bytes.len());
-    }
-    Some((words, bytes.len()))
-}
-
-/// The first `len` bytes of `words`.
-fn as_bytes(words: &[u32], len: usize) -> &[u8] {
-    // SAFETY: in bounds by construction in `read_model_file`.
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), len) }
-}
+use rpi_llm_engine::tokenizer::{BOS, Tokenizer, printable};
 
 #[test]
 fn greedy_generation_matches_llama2_c() {
-    let (Some((model, model_len)), Some((tok, tok_len))) = (
+    let (Some(model), Some(tok)) = (
         read_model_file("stories15M.bin"),
         read_model_file("tokenizer.bin"),
     ) else {
         eprintln!("skipped: no stories15M.bin and tokenizer.bin in models/ (`make models`)");
         return;
     };
-    let checkpoint = as_bytes(&model, model_len);
-    let config = Config::parse(checkpoint).unwrap();
-    let weights = Weights::new(&config, checkpoint).unwrap();
-    let mut transformer = Transformer::new(config, weights);
-    let tokenizer = Tokenizer::new(as_bytes(&tok, tok_len), config.vocab_size).unwrap();
+    let checkpoint = model.bytes();
+    let header = Config::parse(checkpoint).unwrap();
+    let (config, weights) = Weights::from_llama2(&header, checkpoint).unwrap();
+    let mut transformer = Transformer::new(config, weights, 256);
+    let tokenizer = Tokenizer::new(tok.bytes(), config.vocab_size).unwrap();
 
     let prompt = tokenizer.encode("Once upon a time", true, false);
     assert_eq!(prompt, [1, 9038, 2501, 263, 931], "the prompt's tokens");
 
-    let mut generation = Generation::new(prompt, 256);
+    let mut generation = Generation::new(prompt, 256, &[BOS]);
     let mut ids = Vec::new();
     let mut text = Vec::new();
     while let Some(step) = generation.step(&mut transformer) {

@@ -1,61 +1,189 @@
-//! The Llama 2 transformer's forward pass, as llama2.c's `run.c` computes
-//! it, over a checkpoint already in memory.
+//! The Llama transformer's forward pass, over weights already in memory:
+//! llama2.c checkpoints (f32) and GGUF files (Q8_0), the same block either
+//! way.
 //!
-//! The arithmetic is written in `run.c`'s order on purpose: each sum
-//! accumulates left to right, multiply and add are separate operations,
-//! and nothing is reassociated. Floating-point addition is not
-//! associative, so that is what lets this produce the same logits as the
+//! The f32 arithmetic is written in llama2.c's `run.c` order on purpose:
+//! each sum accumulates left to right, multiply and add are separate
+//! operations, and nothing is reassociated. Floating-point addition is not
+//! associative, so that is what lets this produce the same logits as that
 //! reference to the bit (the math library aside), and what makes "same
 //! tokens as llama2.c" a test that can pass exactly rather than a
-//! tolerance to argue about. Faster versions come later, measured against
-//! this one.
+//! tolerance to argue about. The Q8_0 path follows ggml's reference
+//! kernels the same way (see [`crate::quant`]). Faster versions come
+//! later, measured against these.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::llama2::{Config, FormatError, HEADER_BYTES};
+use crate::gguf::{Gguf, Tensor, TensorType};
+use crate::llama2::{self, FormatError, HEADER_BYTES};
+use crate::quant::{self, BLOCK, BLOCK_BYTES, Quantized};
 
-/// The model's weights: typed views into the checkpoint's bytes, in
-/// `run.c`'s `memory_map_weights` layout. Nothing is copied.
+/// A model's shape and the constants its arithmetic needs.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// Width of the residual stream.
+    pub dim: usize,
+    /// Width of the feed-forward layer.
+    pub hidden_dim: usize,
+    /// Transformer layers.
+    pub n_layers: usize,
+    /// Query heads.
+    pub n_heads: usize,
+    /// Key/value heads (fewer than `n_heads` under grouped-query attention).
+    pub n_kv_heads: usize,
+    /// Tokens in the vocabulary.
+    pub vocab_size: usize,
+    /// The longest context the model was trained for.
+    pub seq_len: usize,
+    /// RoPE's base frequency.
+    pub rope_theta: f32,
+    /// The epsilon inside RMSNorm's square root.
+    pub norm_eps: f32,
+}
+
+impl Config {
+    /// Width of one attention head.
+    pub fn head_size(&self) -> usize {
+        self.dim / self.n_heads
+    }
+
+    /// Width of the keys and values: one head's worth per key/value head.
+    pub fn kv_dim(&self) -> usize {
+        self.n_kv_heads * self.head_size()
+    }
+}
+
+impl From<&llama2::Config> for Config {
+    /// llama2.c's format has no field for either constant: `run.c` uses
+    /// 10000 and 1e-5.
+    fn from(c: &llama2::Config) -> Self {
+        Self {
+            dim: c.dim,
+            hidden_dim: c.hidden_dim,
+            n_layers: c.n_layers,
+            n_heads: c.n_heads,
+            n_kv_heads: c.n_kv_heads,
+            vocab_size: c.vocab_size,
+            seq_len: c.seq_len,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+        }
+    }
+}
+
+/// Why weights could not be read out of a file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModelError {
+    /// The llama2.c checkpoint itself is malformed.
+    Format(FormatError),
+    /// A metadata key the model needs is missing or the wrong type.
+    Metadata(&'static str),
+    /// A tensor the model needs is missing.
+    MissingTensor(String),
+    /// A tensor is not the shape the metadata implies.
+    Shape(String),
+    /// A tensor is stored in a type this engine does not compute with.
+    Unsupported(String),
+    /// An f32 tensor does not start on a 4-byte boundary, so it cannot be
+    /// read in place.
+    Misaligned(String),
+}
+
+impl From<FormatError> for ModelError {
+    fn from(e: FormatError) -> Self {
+        Self::Format(e)
+    }
+}
+
+/// A weight matrix of `rows` rows of `cols` columns, row-major, in
+/// whichever form the file stores it.
+#[derive(Clone, Copy)]
+pub enum Matrix<'a> {
+    /// Plain `f32`s.
+    F32 {
+        /// The elements.
+        data: &'a [f32],
+        /// Elements per row.
+        cols: usize,
+    },
+    /// Q8_0 blocks, `cols / 32` per row.
+    Q8_0 {
+        /// The blocks, as stored.
+        data: &'a [u8],
+        /// Elements per row.
+        cols: usize,
+    },
+}
+
+impl Matrix<'_> {
+    /// Elements per row.
+    pub fn cols(&self) -> usize {
+        match *self {
+            Self::F32 { cols, .. } | Self::Q8_0 { cols, .. } => cols,
+        }
+    }
+
+    /// Row `i`, as `f32`s, into `out`: an embedding lookup.
+    fn row_into(&self, i: usize, out: &mut [f32]) {
+        match *self {
+            Self::F32 { data, cols } => out.copy_from_slice(&data[i * cols..(i + 1) * cols]),
+            Self::Q8_0 { data, cols } => {
+                let bytes = cols / BLOCK * BLOCK_BYTES;
+                quant::dequantize(&data[i * bytes..(i + 1) * bytes], out);
+            }
+        }
+    }
+}
+
+/// One transformer block's weights.
+pub struct Layer<'a> {
+    /// RMSNorm before attention, `(dim,)`.
+    rms_att: &'a [f32],
+    /// Query projection, `(dim, dim)`.
+    wq: Matrix<'a>,
+    /// Key projection, `(kv_dim, dim)`.
+    wk: Matrix<'a>,
+    /// Value projection, `(kv_dim, dim)`.
+    wv: Matrix<'a>,
+    /// Attention output projection, `(dim, dim)`.
+    wo: Matrix<'a>,
+    /// RMSNorm before the feed-forward layer, `(dim,)`.
+    rms_ffn: &'a [f32],
+    /// The gate projection, `(hidden_dim, dim)`.
+    w1: Matrix<'a>,
+    /// The down projection, `(dim, hidden_dim)`.
+    w2: Matrix<'a>,
+    /// The up projection, `(hidden_dim, dim)`.
+    w3: Matrix<'a>,
+}
+
+/// The model's weights: views into the file's bytes. Nothing is copied.
 pub struct Weights<'a> {
     /// `(vocab_size, dim)`.
-    token_embedding: &'a [f32],
-    /// `(n_layers, dim)`.
-    rms_att: &'a [f32],
-    /// `(n_layers, dim, dim)`.
-    wq: &'a [f32],
-    /// `(n_layers, kv_dim, dim)`.
-    wk: &'a [f32],
-    /// `(n_layers, kv_dim, dim)`.
-    wv: &'a [f32],
-    /// `(n_layers, dim, dim)`.
-    wo: &'a [f32],
-    /// `(n_layers, dim)`.
-    rms_ffn: &'a [f32],
-    /// `(n_layers, hidden_dim, dim)`.
-    w1: &'a [f32],
-    /// `(n_layers, dim, hidden_dim)`.
-    w2: &'a [f32],
-    /// `(n_layers, hidden_dim, dim)`.
-    w3: &'a [f32],
-    /// `(dim,)`.
+    token_embedding: Matrix<'a>,
+    /// The transformer blocks.
+    layers: Vec<Layer<'a>>,
+    /// The last RMSNorm, `(dim,)`.
     rms_final: &'a [f32],
     /// `(vocab_size, dim)`: the embedding table again when shared.
-    classifier: &'a [f32],
+    classifier: Matrix<'a>,
 }
 
 impl<'a> Weights<'a> {
-    /// Views the weights in `checkpoint`, which [`Config::parse`] has
-    /// already accepted.
-    ///
-    /// # Errors
-    ///
-    /// [`FormatError::Misaligned`] unless the bytes after the header start
-    /// on a 4-byte boundary: they are read in place as `f32`s.
-    pub fn new(config: &Config, checkpoint: &'a [u8]) -> Result<Self, FormatError> {
+    /// Views the weights in a llama2.c `checkpoint`, which
+    /// [`llama2::Config::parse`] has already accepted, in `run.c`'s
+    /// `memory_map_weights` layout.
+    pub fn from_llama2(
+        c: &llama2::Config,
+        checkpoint: &'a [u8],
+    ) -> Result<(Config, Self), ModelError> {
+        let config = Config::from(c);
         let body = &checkpoint[HEADER_BYTES..];
         if !(body.as_ptr() as usize).is_multiple_of(core::mem::align_of::<f32>()) {
-            return Err(FormatError::Misaligned);
+            return Err(FormatError::Misaligned.into());
         }
         // SAFETY: aligned (checked above), in bounds (the slice is the
         // body's own length in `f32`s), and every bit pattern is a valid
@@ -63,49 +191,182 @@ impl<'a> Weights<'a> {
         let floats: &'a [f32] =
             unsafe { core::slice::from_raw_parts(body.as_ptr().cast(), body.len() / 4) };
 
-        let (dim, hidden, layers) = (config.dim, config.hidden_dim, config.n_layers);
-        let kv_dim = config.n_kv_heads * config.head_size();
+        let (dim, hidden, n_layers) = (config.dim, config.hidden_dim, config.n_layers);
+        let kv_dim = config.kv_dim();
         let mut rest = floats;
         let mut take = |n: usize| {
             let (head, tail) = rest.split_at(n);
             rest = tail;
             head
         };
+        let f32s = |data, cols| Matrix::F32 { data, cols };
 
         let token_embedding = take(config.vocab_size * dim);
-        let rms_att = take(layers * dim);
-        let wq = take(layers * dim * dim);
-        let wk = take(layers * dim * kv_dim);
-        let wv = take(layers * dim * kv_dim);
-        let wo = take(layers * dim * dim);
-        let rms_ffn = take(layers * dim);
-        let w1 = take(layers * dim * hidden);
-        let w2 = take(layers * hidden * dim);
-        let w3 = take(layers * dim * hidden);
+        // llama2.c stores each kind of tensor for every layer together.
+        let rms_att = take(n_layers * dim);
+        let wq = take(n_layers * dim * dim);
+        let wk = take(n_layers * dim * kv_dim);
+        let wv = take(n_layers * dim * kv_dim);
+        let wo = take(n_layers * dim * dim);
+        let rms_ffn = take(n_layers * dim);
+        let w1 = take(n_layers * dim * hidden);
+        let w2 = take(n_layers * hidden * dim);
+        let w3 = take(n_layers * dim * hidden);
         let rms_final = take(dim);
         // The obsolete RoPE tables `run.c` skips over.
         take(config.seq_len * config.head_size());
-        let classifier = if config.shared_classifier {
+        let classifier = if c.shared_classifier {
             token_embedding
         } else {
             take(config.vocab_size * dim)
         };
 
-        Ok(Self {
-            token_embedding,
-            rms_att,
-            wq,
-            wk,
-            wv,
-            wo,
-            rms_ffn,
-            w1,
-            w2,
-            w3,
-            rms_final,
-            classifier,
-        })
+        let per = |t: &'a [f32], l: usize, n: usize| &t[l * n..(l + 1) * n];
+        let layers = (0..n_layers)
+            .map(|l| Layer {
+                rms_att: per(rms_att, l, dim),
+                wq: f32s(per(wq, l, dim * dim), dim),
+                wk: f32s(per(wk, l, dim * kv_dim), dim),
+                wv: f32s(per(wv, l, dim * kv_dim), dim),
+                wo: f32s(per(wo, l, dim * dim), dim),
+                rms_ffn: per(rms_ffn, l, dim),
+                w1: f32s(per(w1, l, dim * hidden), dim),
+                w2: f32s(per(w2, l, hidden * dim), hidden),
+                w3: f32s(per(w3, l, dim * hidden), dim),
+            })
+            .collect();
+
+        Ok((
+            config,
+            Self {
+                token_embedding: f32s(token_embedding, dim),
+                layers,
+                rms_final,
+                classifier: f32s(classifier, dim),
+            },
+        ))
     }
+
+    /// Views the weights of a `llama`-architecture GGUF model, and reads
+    /// its shape from the metadata.
+    ///
+    /// Matrices may be F32 or Q8_0, norms must be F32. The output layer is
+    /// `output.weight` if there is one, and the embedding table otherwise
+    /// (tied weights, as in SmolLM2).
+    ///
+    /// The RoPE pairing needs no handling here: llama.cpp's converter
+    /// permutes the query and key weights so that GGUF `llama` models
+    /// rotate adjacent pairs, as llama2.c's checkpoints do.
+    pub fn from_gguf(gguf: &Gguf<'a>) -> Result<(Config, Self), ModelError> {
+        let arch = gguf
+            .string("general.architecture")
+            .ok_or(ModelError::Metadata("general.architecture"))?;
+        if arch != "llama" {
+            return Err(ModelError::Metadata("general.architecture"));
+        }
+        let uint = |key: &'static str| {
+            gguf.uint(key)
+                .map(|v| v as usize)
+                .ok_or(ModelError::Metadata(key))
+        };
+        let float = |key: &'static str| {
+            gguf.float(key)
+                .map(|v| v as f32)
+                .ok_or(ModelError::Metadata(key))
+        };
+        let tokens = gguf
+            .array("tokenizer.ggml.tokens")
+            .ok_or(ModelError::Metadata("tokenizer.ggml.tokens"))?;
+
+        let config = Config {
+            dim: uint("llama.embedding_length")?,
+            hidden_dim: uint("llama.feed_forward_length")?,
+            n_layers: uint("llama.block_count")?,
+            n_heads: uint("llama.attention.head_count")?,
+            n_kv_heads: uint("llama.attention.head_count_kv")?,
+            vocab_size: tokens.len,
+            seq_len: uint("llama.context_length")?,
+            rope_theta: gguf
+                .float("llama.rope.freq_base")
+                .map_or(10000.0, |v| v as f32),
+            norm_eps: float("llama.attention.layer_norm_rms_epsilon")?,
+        };
+        let (dim, hidden, kv_dim) = (config.dim, config.hidden_dim, config.kv_dim());
+
+        let matrix = |name: &str, rows: usize, cols: usize| -> Result<Matrix<'a>, ModelError> {
+            let t = tensor(gguf, name)?;
+            if t.n_dims != 2 || t.dims[0] as usize != cols || t.dims[1] as usize != rows {
+                return Err(ModelError::Shape(name.into()));
+            }
+            match t.kind {
+                TensorType::F32 => Ok(Matrix::F32 {
+                    data: f32_view(t)?,
+                    cols,
+                }),
+                TensorType::Q8_0 if cols.is_multiple_of(BLOCK) => {
+                    Ok(Matrix::Q8_0 { data: t.data, cols })
+                }
+                _ => Err(ModelError::Unsupported(name.into())),
+            }
+        };
+        let vector = |name: &str, len: usize| -> Result<&'a [f32], ModelError> {
+            let t = tensor(gguf, name)?;
+            if t.elements() as usize != len || t.kind != TensorType::F32 {
+                return Err(ModelError::Shape(name.into()));
+            }
+            f32_view(t)
+        };
+
+        let token_embedding = matrix("token_embd.weight", config.vocab_size, dim)?;
+        let layers = (0..config.n_layers)
+            .map(|l| {
+                let name = |part: &str| format!("blk.{l}.{part}.weight");
+                Ok(Layer {
+                    rms_att: vector(&name("attn_norm"), dim)?,
+                    wq: matrix(&name("attn_q"), dim, dim)?,
+                    wk: matrix(&name("attn_k"), kv_dim, dim)?,
+                    wv: matrix(&name("attn_v"), kv_dim, dim)?,
+                    wo: matrix(&name("attn_output"), dim, dim)?,
+                    rms_ffn: vector(&name("ffn_norm"), dim)?,
+                    w1: matrix(&name("ffn_gate"), hidden, dim)?,
+                    w2: matrix(&name("ffn_down"), dim, hidden)?,
+                    w3: matrix(&name("ffn_up"), hidden, dim)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ModelError>>()?;
+        let rms_final = vector("output_norm.weight", dim)?;
+        let classifier = match gguf.tensor("output.weight") {
+            Some(_) => matrix("output.weight", config.vocab_size, dim)?,
+            None => token_embedding,
+        };
+
+        Ok((
+            config,
+            Self {
+                token_embedding,
+                layers,
+                rms_final,
+                classifier,
+            },
+        ))
+    }
+}
+
+/// The tensor called `name`, or the error naming it.
+fn tensor<'a, 'g>(gguf: &'g Gguf<'a>, name: &str) -> Result<&'g Tensor<'a>, ModelError> {
+    gguf.tensor(name)
+        .ok_or_else(|| ModelError::MissingTensor(name.into()))
+}
+
+/// An F32 tensor's data as `f32`s, in place.
+fn f32_view<'a>(t: &Tensor<'a>) -> Result<&'a [f32], ModelError> {
+    if !(t.data.as_ptr() as usize).is_multiple_of(core::mem::align_of::<f32>()) {
+        return Err(ModelError::Misaligned(t.name.into()));
+    }
+    // SAFETY: aligned (checked above), in bounds (the data's own length in
+    // `f32`s), every bit pattern is a valid `f32`, and GGUF is
+    // little-endian like every target this runs on.
+    Ok(unsafe { core::slice::from_raw_parts(t.data.as_ptr().cast(), t.data.len() / 4) })
 }
 
 /// A model ready to run: its shape, its weights, and the activations and
@@ -113,6 +374,8 @@ impl<'a> Weights<'a> {
 pub struct Transformer<'a> {
     config: Config,
     weights: Weights<'a>,
+    /// The positions the key/value cache holds.
+    context: usize,
     /// The residual stream, `(dim,)`.
     x: Vec<f32>,
     /// Inside a residual branch, `(dim,)`.
@@ -125,22 +388,29 @@ pub struct Transformer<'a> {
     hb2: Vec<f32>,
     /// The query, `(dim,)`.
     q: Vec<f32>,
-    /// Attention scores, `(n_heads, seq_len)`.
+    /// Attention scores, `(n_heads, context)`.
     att: Vec<f32>,
     /// The output, `(vocab_size,)`.
     logits: Vec<f32>,
-    /// Keys for every layer and position so far, `(n_layers, seq_len,
+    /// Keys for every layer and position so far, `(n_layers, context,
     /// kv_dim)`.
     key_cache: Vec<f32>,
     /// Values, laid out as `key_cache`.
     value_cache: Vec<f32>,
+    /// The input of a Q8_0 matrix multiply, quantized.
+    quantized: Quantized,
 }
 
 impl<'a> Transformer<'a> {
-    /// A model over `weights`, with its buffers allocated and zeroed.
-    pub fn new(config: Config, weights: Weights<'a>) -> Self {
-        let kv_dim = config.n_kv_heads * config.head_size();
-        let cache = config.n_layers * config.seq_len * kv_dim;
+    /// A model over `weights`, with its buffers allocated and zeroed, and
+    /// room in its key/value cache for `context` positions or the model's
+    /// own context length, whichever is less.
+    ///
+    /// The cap matters: the cache is `2 * n_layers * kv_dim` floats a
+    /// position, and at SmolLM2's 8192-token context that is 671 MB.
+    pub fn new(config: Config, weights: Weights<'a>, context: usize) -> Self {
+        let context = context.min(config.seq_len);
+        let cache = config.n_layers * context * config.kv_dim();
         Self {
             x: vec![0.0; config.dim],
             xb: vec![0.0; config.dim],
@@ -148,10 +418,12 @@ impl<'a> Transformer<'a> {
             hb: vec![0.0; config.hidden_dim],
             hb2: vec![0.0; config.hidden_dim],
             q: vec![0.0; config.dim],
-            att: vec![0.0; config.n_heads * config.seq_len],
+            att: vec![0.0; config.n_heads * context],
             logits: vec![0.0; config.vocab_size],
             key_cache: vec![0.0; cache],
             value_cache: vec![0.0; cache],
+            quantized: Quantized::default(),
+            context,
             config,
             weights,
         }
@@ -160,6 +432,11 @@ impl<'a> Transformer<'a> {
     /// The model's shape.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The positions the key/value cache holds.
+    pub fn context(&self) -> usize {
+        self.context
     }
 
     /// Runs `token` through the model at position `pos` and returns the
@@ -171,46 +448,46 @@ impl<'a> Transformer<'a> {
     ///
     /// # Panics
     ///
-    /// If `pos` is at or past the context length, or `token` is outside
-    /// the vocabulary.
+    /// If `pos` is at or past [`Self::context`], or `token` is outside the
+    /// vocabulary.
     pub fn forward(&mut self, token: u32, pos: usize) -> &[f32] {
         let c = self.config;
         let w = &self.weights;
-        let (dim, hidden) = (c.dim, c.hidden_dim);
+        let (dim, ctx) = (c.dim, self.context);
         let head_size = c.head_size();
-        let kv_dim = c.n_kv_heads * head_size;
+        let kv_dim = c.kv_dim();
         let kv_mul = c.n_heads / c.n_kv_heads;
-        assert!(pos < c.seq_len, "position {pos} is past the context");
+        assert!(pos < ctx, "position {pos} is past the context");
 
-        let token = token as usize;
-        self.x
-            .copy_from_slice(&w.token_embedding[token * dim..(token + 1) * dim]);
+        w.token_embedding.row_into(token as usize, &mut self.x);
 
-        for l in 0..c.n_layers {
-            rmsnorm(&mut self.xb, &self.x, &w.rms_att[l * dim..(l + 1) * dim]);
+        for (l, layer) in w.layers.iter().enumerate() {
+            rmsnorm(&mut self.xb, &self.x, layer.rms_att, c.norm_eps);
 
             // This position's key and value go straight into the cache.
-            let layer = l * c.seq_len * kv_dim;
-            let at = layer + pos * kv_dim;
-            matmul(&mut self.q, &self.xb, layer_of(w.wq, l, dim * dim));
+            let base = l * ctx * kv_dim;
+            let at = base + pos * kv_dim;
+            matmul(&mut self.q, &self.xb, &layer.wq, &mut self.quantized);
             matmul(
                 &mut self.key_cache[at..at + kv_dim],
                 &self.xb,
-                layer_of(w.wk, l, dim * kv_dim),
+                &layer.wk,
+                &mut self.quantized,
             );
             matmul(
                 &mut self.value_cache[at..at + kv_dim],
                 &self.xb,
-                layer_of(w.wv, l, dim * kv_dim),
+                &layer.wv,
+                &mut self.quantized,
             );
 
-            // RoPE: rotate each pair of the query, and of the key while
-            // inside it, by an angle set by the position and the pair's
-            // place in its head.
+            // RoPE: rotate each adjacent pair of the query, and of the key
+            // while inside it, by an angle set by the position and the
+            // pair's place in its head.
             let k = &mut self.key_cache[at..at + kv_dim];
             for i in (0..dim).step_by(2) {
                 let head_dim = i % head_size;
-                let freq = 1.0 / libm::powf(10000.0, head_dim as f32 / head_size as f32);
+                let freq = 1.0 / libm::powf(c.rope_theta, head_dim as f32 / head_size as f32);
                 let val = pos as f32 * freq;
                 let (fcr, fci) = (libm::cosf(val), libm::sinf(val));
                 rotate(&mut self.q[i..i + 2], fcr, fci);
@@ -223,42 +500,40 @@ impl<'a> Transformer<'a> {
             let scale = libm::sqrtf(head_size as f32);
             for h in 0..c.n_heads {
                 let q = &self.q[h * head_size..(h + 1) * head_size];
-                let att = &mut self.att[h * c.seq_len..h * c.seq_len + pos + 1];
+                let att = &mut self.att[h * ctx..h * ctx + pos + 1];
                 let kv_head = (h / kv_mul) * head_size;
                 for (t, score) in att.iter_mut().enumerate() {
-                    let base = layer + t * kv_dim + kv_head;
-                    let k = &self.key_cache[base..base + head_size];
-                    *score = dot(q, k) / scale;
+                    let at = base + t * kv_dim + kv_head;
+                    *score = dot(q, &self.key_cache[at..at + head_size]) / scale;
                 }
                 softmax(att);
 
                 let xb = &mut self.xb[h * head_size..(h + 1) * head_size];
                 xb.fill(0.0);
                 for (t, &a) in att.iter().enumerate() {
-                    let base = layer + t * kv_dim + kv_head;
-                    let v = &self.value_cache[base..base + head_size];
-                    for (out, &v) in xb.iter_mut().zip(v) {
+                    let at = base + t * kv_dim + kv_head;
+                    for (out, &v) in xb.iter_mut().zip(&self.value_cache[at..at + head_size]) {
                         *out += a * v;
                     }
                 }
             }
 
-            matmul(&mut self.xb2, &self.xb, layer_of(w.wo, l, dim * dim));
+            matmul(&mut self.xb2, &self.xb, &layer.wo, &mut self.quantized);
             for (x, &d) in self.x.iter_mut().zip(&self.xb2) {
                 *x += d;
             }
 
             // The feed-forward layer: w2(silu(w1(x)) * w3(x)).
-            rmsnorm(&mut self.xb, &self.x, &w.rms_ffn[l * dim..(l + 1) * dim]);
-            matmul(&mut self.hb, &self.xb, layer_of(w.w1, l, dim * hidden));
-            matmul(&mut self.hb2, &self.xb, layer_of(w.w3, l, dim * hidden));
+            rmsnorm(&mut self.xb, &self.x, layer.rms_ffn, c.norm_eps);
+            matmul(&mut self.hb, &self.xb, &layer.w1, &mut self.quantized);
+            matmul(&mut self.hb2, &self.xb, &layer.w3, &mut self.quantized);
             for (h, &g) in self.hb.iter_mut().zip(&self.hb2) {
                 let mut val = *h;
                 val *= 1.0 / (1.0 + libm::expf(-val));
                 val *= g;
                 *h = val;
             }
-            matmul(&mut self.xb, &self.hb, layer_of(w.w2, l, hidden * dim));
+            matmul(&mut self.xb, &self.hb, &layer.w2, &mut self.quantized);
             for (x, &d) in self.x.iter_mut().zip(&self.xb) {
                 *x += d;
             }
@@ -267,25 +542,25 @@ impl<'a> Transformer<'a> {
         // `run.c` normalises `x` in place; a copy of the input keeps the
         // borrow checker satisfied and changes no arithmetic.
         self.xb.copy_from_slice(&self.x);
-        rmsnorm(&mut self.x, &self.xb, w.rms_final);
-        matmul(&mut self.logits, &self.x, w.classifier);
+        rmsnorm(&mut self.x, &self.xb, w.rms_final, c.norm_eps);
+        matmul(
+            &mut self.logits,
+            &self.x,
+            &w.classifier,
+            &mut self.quantized,
+        );
         &self.logits
     }
 }
 
-/// Layer `l`'s slice of a tensor stacked `size` elements per layer.
-fn layer_of(tensor: &[f32], l: usize, size: usize) -> &[f32] {
-    &tensor[l * size..(l + 1) * size]
-}
-
 /// `out = weight * x / rms(x)`, `run.c`'s `rmsnorm`.
-fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32]) {
+fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     let mut ss = 0.0f32;
     for &v in x {
         ss += v * v;
     }
     ss /= x.len() as f32;
-    ss += 1e-5;
+    ss += eps;
     ss = 1.0 / libm::sqrtf(ss);
     for ((o, &w), &v) in out.iter_mut().zip(weight).zip(x) {
         *o = w * (ss * v);
@@ -305,15 +580,26 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
-/// `out = w @ x` for `w` of shape `(out.len(), x.len())`, row-major.
+/// `out = w @ x`, one output per row of `w`.
 ///
 /// Where nearly all the time goes, and where the faster versions will go:
-/// this one is the plain loop `run.c` has, kept as the reference they are
-/// checked against.
-fn matmul(out: &mut [f32], x: &[f32], w: &[f32]) {
-    let n = x.len();
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = dot(&w[i * n..(i + 1) * n], x);
+/// these are the plain loops the references have, kept as what those are
+/// checked against. A Q8_0 matrix quantizes `x` into `scratch` first, as
+/// ggml does.
+fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, scratch: &mut Quantized) {
+    match *w {
+        Matrix::F32 { data, cols } => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = dot(&data[i * cols..(i + 1) * cols], x);
+            }
+        }
+        Matrix::Q8_0 { data, cols } => {
+            quant::quantize(x, scratch);
+            let bytes = cols / BLOCK * BLOCK_BYTES;
+            for (o, row) in out.iter_mut().zip(data.chunks_exact(bytes)) {
+                *o = quant::dot(row, scratch);
+            }
+        }
     }
 }
 

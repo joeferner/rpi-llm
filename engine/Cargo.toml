@@ -10,3 +10,7 @@ description = "The model side of rpi-llm: file formats and inference, with no ha
 # with no OS there is no C library to supply them. The same crate on the
 # host and the board, so the two compute the same bits.
 libm = "0.2"
+
+[dev-dependencies]
+# Reading the tokenizer test cases recorded from llama.cpp.
+serde_json = "1"

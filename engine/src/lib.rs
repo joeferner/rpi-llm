@@ -14,8 +14,11 @@
 
 extern crate alloc;
 
+pub mod bpe;
 pub mod generate;
+pub mod gguf;
 pub mod llama2;
 pub mod model;
+pub mod quant;
 pub mod sample;
 pub mod tokenizer;
