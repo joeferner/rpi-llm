@@ -1,0 +1,16 @@
+# Firmware settings for the Raspberry Pi 5 (preliminary). The VideoCore firmware reads
+# this before any ARM code runs, so it decides which kernel file is loaded
+# and in which mode.
+
+arm_64bit=1
+kernel=kernel8.img
+# rpi-hal links AArch64 images at 0x80000; don't rely on the firmware's
+# default for an image without a Linux header.
+kernel_address=0x80000
+# Without this the firmware refuses a kernel it can't match to a device
+# tree on the card, and nothing here is a Linux kernel.
+os_check=0
+# Leave the PCIe link to the RP1 chip trained up rather than resetting it
+# before the kernel starts: the console's GPIO14/15, like every header
+# pin, are on RP1, and rpi-hal has no PCIe driver of its own.
+pciex4_reset=0

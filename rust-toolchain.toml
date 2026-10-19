@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+# `llvm-tools` is behind `cargo objcopy`, which turns the linked ELF into
+# the raw image the firmware loads.
+components = ["llvm-tools"]
+targets = ["aarch64-unknown-none-softfloat"]
