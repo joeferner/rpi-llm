@@ -19,6 +19,7 @@ pub mod generate;
 pub mod gguf;
 pub mod llama2;
 pub mod model;
+pub mod parallel;
 pub mod quant;
 pub mod sample;
 pub mod tokenizer;

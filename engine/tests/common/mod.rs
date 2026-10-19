@@ -3,6 +3,28 @@
 
 use std::path::PathBuf;
 
+use rpi_llm_engine::parallel::Workers;
+
+/// [`Workers`] as OS threads, a fresh set per job: slow, but the same
+/// split the board's cores run, which is what the tests need.
+#[allow(dead_code, reason = "not every test file runs in parallel")]
+pub struct Threads(pub usize);
+
+impl Workers for Threads {
+    fn count(&self) -> usize {
+        self.0
+    }
+
+    fn run(&self, job: &(dyn Fn(usize) + Sync)) {
+        std::thread::scope(|scope| {
+            for i in 1..self.0 {
+                scope.spawn(move || job(i));
+            }
+            job(0);
+        });
+    }
+}
+
 /// The repository's `models/` directory, where `make models` puts them.
 pub fn models() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models")

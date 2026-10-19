@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 
 use crate::gguf::{Gguf, Repacked, Tensor, TensorType};
 use crate::llama2::{self, FormatError, HEADER_BYTES};
+use crate::parallel::{Serial, Shared, Workers, for_each, for_rows};
 use crate::quant::{self, BLOCK, Block, Quantized};
 
 /// A model's shape and the constants its arithmetic needs.
@@ -412,8 +413,16 @@ pub struct Transformer<'a> {
     key_cache: Vec<f32>,
     /// Values, laid out as `key_cache`.
     value_cache: Vec<f32>,
+    /// What every matrix multiply needs besides its operands.
+    mm: MatMul<'a>,
+}
+
+/// A matrix multiply's scratch space and the workers it is split across.
+struct MatMul<'a> {
     /// The input of a Q8_0 matrix multiply, quantized.
-    quantized: Quantized,
+    scratch: Quantized,
+    /// Who computes the output rows.
+    workers: &'a dyn Workers,
 }
 
 impl<'a> Transformer<'a> {
@@ -437,7 +446,10 @@ impl<'a> Transformer<'a> {
             logits: vec![0.0; config.vocab_size],
             key_cache: vec![0.0; cache],
             value_cache: vec![0.0; cache],
-            quantized: Quantized::default(),
+            mm: MatMul {
+                scratch: Quantized::default(),
+                workers: &Serial,
+            },
             context,
             config,
             weights,
@@ -452,6 +464,13 @@ impl<'a> Transformer<'a> {
     /// The positions the key/value cache holds.
     pub fn context(&self) -> usize {
         self.context
+    }
+
+    /// Splits every matrix multiply's rows across `workers` from now on.
+    /// The results are the same bits as on one worker (see
+    /// [`crate::parallel`]).
+    pub fn set_workers(&mut self, workers: &'a dyn Workers) {
+        self.mm.workers = workers;
     }
 
     /// Runs `token` through the model at position `pos` and returns the
@@ -482,18 +501,18 @@ impl<'a> Transformer<'a> {
             // This position's key and value go straight into the cache.
             let base = l * ctx * kv_dim;
             let at = base + pos * kv_dim;
-            matmul(&mut self.q, &self.xb, &layer.wq, &mut self.quantized);
+            matmul(&mut self.q, &self.xb, &layer.wq, &mut self.mm);
             matmul(
                 &mut self.key_cache[at..at + kv_dim],
                 &self.xb,
                 &layer.wk,
-                &mut self.quantized,
+                &mut self.mm,
             );
             matmul(
                 &mut self.value_cache[at..at + kv_dim],
                 &self.xb,
                 &layer.wv,
-                &mut self.quantized,
+                &mut self.mm,
             );
 
             // RoPE: rotate each adjacent pair of the query, and of the key
@@ -511,44 +530,57 @@ impl<'a> Transformer<'a> {
                 }
             }
 
-            // Attention, head by head, over every position so far.
+            // Attention over every position so far, the heads split across
+            // the workers. Each head reads the shared query and cache and
+            // writes only its own scores and its own slice of `xb`, and its
+            // arithmetic is the same whichever worker runs it.
             let scale = libm::sqrtf(head_size as f32);
-            for h in 0..c.n_heads {
-                let q = &self.q[h * head_size..(h + 1) * head_size];
-                let att = &mut self.att[h * ctx..h * ctx + pos + 1];
+            let scores = Shared::new(&mut self.att);
+            let outputs = Shared::new(&mut self.xb);
+            let (queries, keys, values) = (&self.q, &self.key_cache, &self.value_cache);
+            for_each(self.mm.workers, c.n_heads, |h| {
+                let q = &queries[h * head_size..(h + 1) * head_size];
+                // SAFETY: head `h`'s scores and its slice of `xb` are
+                // disjoint from every other head's, and each head runs on
+                // one worker.
+                let (att, xb) = unsafe {
+                    (
+                        scores.slice(h * ctx, pos + 1),
+                        outputs.slice(h * head_size, head_size),
+                    )
+                };
                 let kv_head = (h / kv_mul) * head_size;
                 for (t, score) in att.iter_mut().enumerate() {
                     let at = base + t * kv_dim + kv_head;
-                    *score = dot(q, &self.key_cache[at..at + head_size]) / scale;
+                    *score = dot(q, &keys[at..at + head_size]) / scale;
                 }
                 softmax(att);
 
-                let xb = &mut self.xb[h * head_size..(h + 1) * head_size];
                 xb.fill(0.0);
                 for (t, &a) in att.iter().enumerate() {
                     let at = base + t * kv_dim + kv_head;
-                    for (out, &v) in xb.iter_mut().zip(&self.value_cache[at..at + head_size]) {
+                    for (out, &v) in xb.iter_mut().zip(&values[at..at + head_size]) {
                         *out += a * v;
                     }
                 }
-            }
+            });
 
-            matmul(&mut self.xb2, &self.xb, &layer.wo, &mut self.quantized);
+            matmul(&mut self.xb2, &self.xb, &layer.wo, &mut self.mm);
             for (x, &d) in self.x.iter_mut().zip(&self.xb2) {
                 *x += d;
             }
 
             // The feed-forward layer: w2(silu(w1(x)) * w3(x)).
             rmsnorm(&mut self.xb, &self.x, layer.rms_ffn, c.norm_eps);
-            matmul(&mut self.hb, &self.xb, &layer.w1, &mut self.quantized);
-            matmul(&mut self.hb2, &self.xb, &layer.w3, &mut self.quantized);
+            matmul(&mut self.hb, &self.xb, &layer.w1, &mut self.mm);
+            matmul(&mut self.hb2, &self.xb, &layer.w3, &mut self.mm);
             for (h, &g) in self.hb.iter_mut().zip(&self.hb2) {
                 let mut val = *h;
                 val *= 1.0 / (1.0 + libm::expf(-val));
                 val *= g;
                 *h = val;
             }
-            matmul(&mut self.xb, &self.hb, &layer.w2, &mut self.quantized);
+            matmul(&mut self.xb, &self.hb, &layer.w2, &mut self.mm);
             for (x, &d) in self.x.iter_mut().zip(&self.xb) {
                 *x += d;
             }
@@ -558,12 +590,7 @@ impl<'a> Transformer<'a> {
         // borrow checker satisfied and changes no arithmetic.
         self.xb.copy_from_slice(&self.x);
         rmsnorm(&mut self.x, &self.xb, w.rms_final, c.norm_eps);
-        matmul(
-            &mut self.logits,
-            &self.x,
-            &w.classifier,
-            &mut self.quantized,
-        );
+        matmul(&mut self.logits, &self.x, &w.classifier, &mut self.mm);
         &self.logits
     }
 }
@@ -595,32 +622,29 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
-/// `out = w @ x`, one output per row of `w`.
+/// `out = w @ x`, one output per row of `w`, the rows split across the
+/// workers.
 ///
 /// Where nearly all the time goes. An F32 matrix is the plain loop llama2.c
-/// has; a Q8_0 matrix quantizes `x` into `scratch` first, as ggml does, and
-/// takes each row's dot product with [`quant::dot`].
-fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, scratch: &mut Quantized) {
+/// has; a Q8_0 matrix quantizes `x` once, as ggml does, and every worker
+/// takes its rows' dot products with [`quant::dot`] against that.
+fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
     match *w {
         Matrix::F32 { data, cols } => {
-            for (i, o) in out.iter_mut().enumerate() {
-                *o = dot(&data[i * cols..(i + 1) * cols], x);
-            }
+            for_rows(mm.workers, out, |i| dot(&data[i * cols..(i + 1) * cols], x));
         }
         Matrix::Q8_0 {
             values,
             scales,
             cols,
         } => {
-            quant::quantize(x, scratch);
+            quant::quantize(x, &mut mm.scratch);
             let per_row = cols / BLOCK;
-            for ((o, row), row_scales) in out
-                .iter_mut()
-                .zip(values.chunks_exact(per_row))
-                .zip(scales.chunks_exact(per_row))
-            {
-                *o = quant::dot(row, row_scales, scratch);
-            }
+            let scratch = &mm.scratch;
+            for_rows(mm.workers, out, |i| {
+                let row = i * per_row..(i + 1) * per_row;
+                quant::dot(&values[row.clone()], &scales[row], scratch)
+            });
         }
     }
 }

@@ -1,0 +1,99 @@
+//! Splitting the model's work across cores, without knowing what a core
+//! is.
+//!
+//! The engine has no hardware in it, so it asks for parallelism through
+//! [`Workers`]: run this job with each index from 0 to `count`, at once,
+//! and return when all are done. The board implements it with the Pi's
+//! four cores; the host tests with threads; [`Serial`] is one worker, the
+//! default.
+//!
+//! What gets split is a matrix multiply's output rows, in contiguous
+//! ranges, one per worker. Each row is the same dot product whichever
+//! worker computes it, so the split changes no result: one worker or four
+//! produce the same bits.
+
+/// Something that runs a job on several workers at once.
+pub trait Workers: Sync {
+    /// How many workers there are: a job's indices are `0..count()`.
+    fn count(&self) -> usize;
+
+    /// Runs `job(i)` for every `i` in `0..count()`, concurrently, and
+    /// returns once every call has returned.
+    fn run(&self, job: &(dyn Fn(usize) + Sync));
+}
+
+/// One worker: the job runs on the calling core.
+pub struct Serial;
+
+impl Workers for Serial {
+    fn count(&self) -> usize {
+        1
+    }
+
+    fn run(&self, job: &(dyn Fn(usize) + Sync)) {
+        job(0);
+    }
+}
+
+/// A buffer the workers share, each writing only its own part of it.
+///
+/// Made from a `&mut [f32]` the caller holds for as long as the workers
+/// run, which keeps everything else away from it meanwhile; the workers'
+/// parts being disjoint is the caller's to guarantee, and every accessor
+/// is `unsafe` for that reason.
+pub(crate) struct Shared {
+    ptr: *mut f32,
+    len: usize,
+}
+
+// SAFETY: see `Shared`: the workers only reach it through accessors whose
+// callers promise disjoint parts.
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    /// Shares `buf`.
+    pub(crate) fn new(buf: &mut [f32]) -> Self {
+        Self {
+            ptr: buf.as_mut_ptr(),
+            len: buf.len(),
+        }
+    }
+
+    /// Elements `start..start + len`, writable.
+    ///
+    /// A method rather than a field access in the workers' closure: a
+    /// closure that named the raw pointer field would capture just that
+    /// pointer, which is not `Sync`, instead of this wrapper, which is.
+    ///
+    /// # Safety
+    ///
+    /// The range must be inside the buffer, and no other worker may touch
+    /// it while the returned slice lives.
+    #[allow(clippy::mut_from_ref, reason = "disjointness is the caller's promise")]
+    pub(crate) unsafe fn slice(&self, start: usize, len: usize) -> &mut [f32] {
+        assert!(start + len <= self.len, "a shared slice out of bounds");
+        // SAFETY: in bounds (checked); exclusive by the caller's promise.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.add(start), len) }
+    }
+}
+
+/// Runs `f(i)` for every `i` in `0..n`, the indices split into contiguous
+/// ranges across `workers`.
+pub(crate) fn for_each(workers: &dyn Workers, n: usize, f: impl Fn(usize) + Sync) {
+    let per = n.div_ceil(workers.count().max(1));
+    workers.run(&|w| {
+        for i in (w * per).min(n)..((w + 1) * per).min(n) {
+            f(i);
+        }
+    });
+}
+
+/// Sets `out[r] = row(r)` for every row, the rows split into contiguous
+/// ranges across `workers`.
+pub(crate) fn for_rows(workers: &dyn Workers, out: &mut [f32], row: impl Fn(usize) -> f32 + Sync) {
+    let rows = Shared::new(out);
+    for_each(workers, rows.len, |r| {
+        // SAFETY: each row index goes to exactly one worker.
+        unsafe { rows.slice(r, 1)[0] = row(r) };
+    });
+}

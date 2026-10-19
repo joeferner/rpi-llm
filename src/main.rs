@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+mod cores;
 mod load;
 mod term;
 
@@ -146,9 +147,30 @@ pub extern "C" fn kmain() -> ! {
     let mut transformer = Transformer::new(config, weights, CONTEXT);
     logln!("model: context {} positions", transformer.context());
 
+    // SAFETY: the only call; nothing else here uses the secondary cores.
+    let pool = unsafe { cores::Pool::start() };
+    transformer.set_workers(pool);
+    logln!("cores: matrix multiplies split across 4 cores");
+
     full_speed(&mut mailbox);
 
+    cores::reset_stats();
+    let started = timer.now_micros();
     let ids = chat(&mut transformer, &bpe, &timer);
+    let total_ms = (timer.now_micros() - started) / 1000;
+    let (per_core, jobs) = cores::stats();
+    logln!(
+        "cores: {jobs} jobs in {total_ms} ms; core 0 worked {} ms, waited {} ms for the others",
+        per_core[0].0 / 1000,
+        per_core[0].1 / 1000
+    );
+    for (id, (work, wake)) in per_core.iter().enumerate().skip(1) {
+        logln!(
+            "cores: core {id} worked {} ms, spent {} ms waking up",
+            work / 1000,
+            wake / 1000
+        );
+    }
     check_against_reference(&ids);
 
     logln!("rpi-llm: done");

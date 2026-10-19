@@ -28,7 +28,7 @@
 
 mod common;
 
-use common::read_model_file;
+use common::{Threads, read_model_file};
 use rpi_llm_engine::bpe::Bpe;
 use rpi_llm_engine::generate::Generation;
 use rpi_llm_engine::gguf::Gguf;
@@ -193,3 +193,35 @@ fn free_running_generation_matches_the_recorded_engine_output() {
 
 /// How many tokens the recorded engine output runs to.
 const STORY_TOKENS: usize = 200;
+
+/// Splitting the matrix multiplies across workers changes nothing: four
+/// threads give the same logits, bit for bit, as one, over the whole
+/// prompt.
+#[test]
+fn four_workers_compute_the_same_bits_as_one() {
+    let Some(mut file) = load() else { return };
+    let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
+    let bpe = Bpe::from_gguf(&gguf).unwrap();
+    let prompt = bpe.encode(STORY_PROMPT);
+
+    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+    let mut serial = Transformer::new(config, weights, prompt.len());
+    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+    let mut parallel = Transformer::new(config, weights, prompt.len());
+    let threads = Threads(4);
+    parallel.set_workers(&threads);
+
+    for (pos, &token) in prompt.iter().enumerate() {
+        let one: Vec<u32> = serial
+            .forward(token, pos)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let four: Vec<u32> = parallel
+            .forward(token, pos)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert!(one == four, "position {pos}: the logits differ");
+    }
+}
