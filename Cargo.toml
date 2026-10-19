@@ -9,13 +9,27 @@ publish = false
 # default, because there is no sensible default chip; this one is for the
 # Raspberry Pi 5 (preliminary).
 rpi-hal = { version = "0.10", features = ["bcm2712"] }
-# The bring-up every board does: here only the console and `logln!`. Each
-# capability is a feature (heap, config, storage, net, web, ota, ...);
-# see https://docs.rs/rpi-kickstart.
-rpi-kickstart = { version = "0.4", features = ["console"] }
-# Hands the console a UART that outlives `kmain`'s stack, without a
-# `static mut`.
+# The bring-up every board does: the console and `logln!`, the heap the
+# weights live on, and the card's FAT volume they are read from. Each
+# capability is a feature; see https://docs.rs/rpi-kickstart.
+rpi-kickstart = { version = "0.4", features = ["console", "heap", "storage"] }
+# The filesystem under rpi-kickstart's `storage`, named here for its
+# `BlockDevice` trait, which the loader is generic over. The version has
+# to be the one rpi-kickstart and rpi-hal's `SdBlockDevice` use, or the
+# card's device implements a different crate's trait.
+resident-fat = { version = "0.3", default-features = false }
+# The lock around the UART that the console and the terminal output
+# (progress lines, streamed tokens) share. rpi-hal's `rt` supplies the
+# implementation.
+critical-section = "1.2"
+# Hands the console its sink for `'static`, without a `static mut`.
 static_cell = "2.1"
+
+# TEMPORARY, until the next rpi-hal release: rpi-hal 0.10 does not build
+# `rpi_hal::mem` for the Pi 5, and rpi-kickstart's `heap` needs it. Remove
+# this once the release that does is out.
+[patch.crates-io]
+rpi-hal = { path = "../rpi-hal/hal" }
 
 # There is no unwinder on bare metal.
 [profile.dev]
