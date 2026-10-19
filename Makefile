@@ -22,7 +22,11 @@ FIRMWARE_FILES :=
 LOADER_URL := https://github.com/joeferner/rpi-hal/releases/download/loader-v0.6.0
 LOADER_IMAGE := rpi-loader-0.6.0-bcm2712-kernel8.img
 
-.PHONY: all build run sd-card clean
+.PHONY: all build run test sd-card clean
+
+# The host's own target, which `make test` builds the engine for:
+# `.cargo/config.toml` points plain `cargo` at the board.
+HOST := $(shell rustc -vV | sed -n 's/^host: //p')
 
 all: build
 
@@ -33,6 +37,10 @@ build:
 
 run: build
 	rpi-loader --device $(DEVICE) boot --load-addr $(LOAD_ADDR) target/$(KERNEL)
+
+# The engine's tests, on this machine rather than the board.
+test:
+	cargo test -p rpi-llm-engine --target $(HOST)
 
 # Everything the card's FAT32 boot partition needs: the Raspberry Pi boot
 # firmware, config.txt, and the rpi-loader image renamed to $(KERNEL) --

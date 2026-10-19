@@ -1,6 +1,13 @@
 # Plain `cargo build` targets the board rather than the host.
+#
+# `aarch64-unknown-none`, the hard-float target, rather than the
+# `-softfloat` one the rpi-hal template starts from: the model's forward
+# pass is floating-point arithmetic end to end, and on the soft-float
+# target every operation is a call into a software routine. This one uses
+# the A76's FP and NEON units directly. rpi-hal's boot code enables them
+# (`rpi_hal::fpu`) before it calls into anything that could use them.
 [build]
-target = "aarch64-unknown-none-softfloat"
+target = "aarch64-unknown-none"
 
 # The linker script comes from rpi-hal, which publishes it on the linker
 # search path as `rpi-link.x`, already linking at 0x80000 for this
@@ -8,5 +15,5 @@ target = "aarch64-unknown-none-softfloat"
 #
 # Ignored outright if a `RUSTFLAGS` environment variable is set, and the
 # symptom is `undefined symbol: __bss_end`.
-[target.aarch64-unknown-none-softfloat]
+[target.aarch64-unknown-none]
 rustflags = ["-C", "link-arg=-Trpi-link.x"]

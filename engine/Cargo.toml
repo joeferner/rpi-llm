@@ -1,0 +1,8 @@
+[package]
+name = "rpi-llm-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The model side of rpi-llm: file formats and inference, with no hardware in it"
+
+[dependencies]

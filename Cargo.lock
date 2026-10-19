@@ -195,8 +195,13 @@ dependencies = [
  "resident-fat",
  "rpi-hal",
  "rpi-kickstart",
+ "rpi-llm-engine",
  "static_cell",
 ]
+
+[[package]]
+name = "rpi-llm-engine"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"

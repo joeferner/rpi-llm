@@ -12,9 +12,10 @@
 
 extern crate alloc;
 
-mod llama2;
 mod load;
 mod term;
+
+use rpi_llm_engine::llama2;
 
 use core::fmt::Write;
 

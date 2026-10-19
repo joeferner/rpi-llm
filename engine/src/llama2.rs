@@ -31,11 +31,7 @@ pub struct Config {
 pub const HEADER_BYTES: usize = 7 * 4;
 
 /// Why a file did not parse as what it was meant to be.
-#[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "the fields are read through `Debug`, in the failure message"
-)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum FormatError {
     /// Shorter than its header.
     Truncated,
@@ -70,6 +66,20 @@ impl Config {
     /// from the header, so a file whose length matches to the byte has
     /// both the right header and all of its weights.
     pub fn parse(checkpoint: &[u8]) -> Result<Self, FormatError> {
+        let config = Self::parse_header(checkpoint)?;
+        let expected = HEADER_BYTES + 4 * config.weight_count();
+        if checkpoint.len() != expected {
+            return Err(FormatError::WrongSize {
+                expected,
+                actual: checkpoint.len(),
+            });
+        }
+        Ok(config)
+    }
+
+    /// Parses just the header at the start of `checkpoint`, checking its
+    /// fields against each other but not against the file's size.
+    pub fn parse_header(checkpoint: &[u8]) -> Result<Self, FormatError> {
         let header = checkpoint
             .get(..HEADER_BYTES)
             .ok_or(FormatError::Truncated)?;
@@ -91,14 +101,6 @@ impl Config {
             || !config.n_heads.is_multiple_of(config.n_kv_heads)
         {
             return Err(FormatError::BadHeader);
-        }
-
-        let expected = HEADER_BYTES + 4 * config.weight_count();
-        if checkpoint.len() != expected {
-            return Err(FormatError::WrongSize {
-                expected,
-                actual: checkpoint.len(),
-            });
         }
         Ok(config)
     }
@@ -184,4 +186,101 @@ pub fn check_tokenizer(
         max_token_length,
         tokens: vocab_size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A checkpoint for a model of the given shape: the header, then zeroed
+    /// weights, `extra` bytes longer than it should be.
+    fn checkpoint(header: [i32; 7], extra: isize) -> Vec<u8> {
+        let mut bytes: Vec<u8> = header.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let config = Config::parse_header(&bytes).unwrap();
+        let len = (4 * config.weight_count()) as isize + extra;
+        bytes.resize(HEADER_BYTES + len as usize, 0);
+        bytes
+    }
+
+    /// stories15M's header, as the real file has it.
+    const STORIES15M: [i32; 7] = [288, 768, 6, 6, 6, 32000, 256];
+
+    #[test]
+    fn stories15m_weight_count_matches_the_real_file() {
+        // The real stories15M.bin is 60,816,028 bytes, header included.
+        let header: Vec<u8> = STORIES15M.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let config = Config::parse_header(&header).unwrap();
+        assert_eq!(HEADER_BYTES + 4 * config.weight_count(), 60_816_028);
+        assert!(config.shared_classifier);
+        assert_eq!(config.head_size(), 48);
+    }
+
+    #[test]
+    fn exact_size_parses() {
+        let config = Config::parse(&checkpoint([16, 32, 2, 4, 2, 10, 8], 0)).unwrap();
+        assert_eq!(
+            (config.dim, config.n_kv_heads, config.vocab_size),
+            (16, 2, 10)
+        );
+    }
+
+    #[test]
+    fn a_byte_short_or_long_is_refused() {
+        for extra in [-1, 1] {
+            let file = checkpoint([16, 32, 2, 4, 2, 10, 8], extra);
+            assert!(matches!(
+                Config::parse(&file),
+                Err(FormatError::WrongSize { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn negative_vocab_means_a_separate_classifier() {
+        let shared = Config::parse(&checkpoint([16, 32, 2, 4, 2, 10, 8], 0)).unwrap();
+        let separate = Config::parse(&checkpoint([16, 32, 2, 4, 2, -10, 8], 0)).unwrap();
+        assert!(!separate.shared_classifier);
+        assert_eq!(separate.vocab_size, 10);
+        assert_eq!(separate.weight_count(), shared.weight_count() + 10 * 16);
+    }
+
+    #[test]
+    fn heads_that_do_not_divide_are_refused() {
+        let header: Vec<u8> = [16, 32, 2, 5, 5, 10, 8]
+            .iter()
+            .flat_map(|v: &i32| v.to_le_bytes())
+            .collect();
+        assert_eq!(Config::parse(&header).unwrap_err(), FormatError::BadHeader);
+    }
+
+    /// A tokenizer file holding `tokens`, each with a zero score.
+    fn tokenizer(max_len: i32, tokens: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = max_len.to_le_bytes().to_vec();
+        for token in tokens {
+            bytes.extend_from_slice(&0f32.to_le_bytes());
+            bytes.extend_from_slice(&(token.len() as i32).to_le_bytes());
+            bytes.extend_from_slice(token);
+        }
+        bytes
+    }
+
+    #[test]
+    fn tokenizer_walks_to_its_last_byte() {
+        let file = tokenizer(3, &[b"a", b"bc", b"def"]);
+        let summary = check_tokenizer(&file, 3).unwrap();
+        assert_eq!((summary.max_token_length, summary.tokens), (3, 3));
+    }
+
+    #[test]
+    fn tokenizer_with_leftovers_or_too_few_tokens_is_refused() {
+        let file = tokenizer(3, &[b"a", b"bc", b"def"]);
+        assert_eq!(
+            check_tokenizer(&file, 2).unwrap_err(),
+            FormatError::TrailingBytes { count: 11 }
+        );
+        assert_eq!(
+            check_tokenizer(&file, 4).unwrap_err(),
+            FormatError::BadToken { index: 3 }
+        );
+    }
 }

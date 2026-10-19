@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[workspace]
+members = ["engine"]
+
 [dependencies]
+# The model side: file formats and inference, kept free of hardware so it
+# can be tested on the host (`make test`).
+rpi-llm-engine = { path = "engine" }
 # The chip feature selects the SoC's peripheral memory map. None is a
 # default, because there is no sensible default chip; this one is for the
 # Raspberry Pi 5 (preliminary).
