@@ -56,6 +56,9 @@ pub enum FormatError {
         /// How many.
         count: usize,
     },
+    /// The checkpoint's weights do not start on a 4-byte boundary, so they
+    /// cannot be read in place as `f32`s.
+    Misaligned,
 }
 
 impl Config {

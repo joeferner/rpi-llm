@@ -6,3 +6,7 @@ publish = false
 description = "The model side of rpi-llm: file formats and inference, with no hardware in it"
 
 [dependencies]
+# `expf`, `sqrtf`, `powf`, `sinf`, `cosf`: `core` has none of them, and
+# with no OS there is no C library to supply them. The same crate on the
+# host and the board, so the two compute the same bits.
+libm = "0.2"

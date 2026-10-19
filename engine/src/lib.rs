@@ -12,4 +12,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+pub mod generate;
 pub mod llama2;
+pub mod model;
+pub mod sample;
+pub mod tokenizer;

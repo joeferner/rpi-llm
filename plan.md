@@ -112,13 +112,11 @@ A serial terminal over the RP1 UART0 (GPIO14/15):
 
 ## Build order
 
-1. `stories15M` on one core over UART, loaded from SD with the progress
-   line, and checked against llama2.c output.
-2. GGUF + Q8_0 + BPE + chat template running SmolLM2-360M, still on one
+1. GGUF + Q8_0 + BPE + chat template running SmolLM2-360M, still on one
    core.
-3. NEON `sdot` matrix multiply.
-4. The parallel matrix multiply across all 4 cores.
-5. Fan control, then the side-by-side benchmark against llama.cpp on
+2. NEON `sdot` matrix multiply.
+3. The parallel matrix multiply across all 4 cores.
+4. Fan control, then the side-by-side benchmark against llama.cpp on
    Raspberry Pi OS.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

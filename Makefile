@@ -1,8 +1,11 @@
-# rpi-llm, for the Raspberry Pi 5 (preliminary) (aarch64-unknown-none-softfloat).
+# rpi-llm, for the Raspberry Pi 5 (preliminary) (aarch64-unknown-none).
 #
 #   make                          build target/kernel8.img
 #   make run DEVICE=/dev/ttyUSB0  build it, upload it over the UART with
 #                                 rpi-loader, and boot it
+#   make test                     the engine's tests, on this machine
+#   make models                   fetch the model files into models/, for
+#                                 the tests and for the card's models/
 #   make sd-card                  fetch what goes on the SD card into
 #                                 sd-card/ (firmware + the rpi-loader image)
 #
@@ -22,7 +25,12 @@ FIRMWARE_FILES :=
 LOADER_URL := https://github.com/joeferner/rpi-hal/releases/download/loader-v0.6.0
 LOADER_IMAGE := rpi-loader-0.6.0-bcm2712-kernel8.img
 
-.PHONY: all build run test sd-card clean
+# What `make models` fetches, checked against models.sha256.
+MODEL_FILES := stories15M.bin tokenizer.bin
+MODEL_URL_stories15M.bin := https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+MODEL_URL_tokenizer.bin := https://raw.githubusercontent.com/karpathy/llama2.c/350e04f/tokenizer.bin
+
+.PHONY: all build run test models sd-card clean
 
 # The host's own target, which `make test` builds the engine for:
 # `.cargo/config.toml` points plain `cargo` at the board.
@@ -38,9 +46,26 @@ build:
 run: build
 	rpi-loader --device $(DEVICE) boot --load-addr $(LOAD_ADDR) target/$(KERNEL)
 
-# The engine's tests, on this machine rather than the board.
+# The engine's tests, on this machine rather than the board. The one
+# that compares against llama2.c needs `make models` first, and skips
+# without it.
 test:
-	cargo test -p rpi-llm-engine --target $(HOST)
+	cargo test --release -p rpi-llm-engine --target $(HOST)
+
+# The model files, for the tests and for copying onto the card's models/.
+models: $(addprefix models/,$(MODEL_FILES))
+
+models/%: models.sha256
+	@mkdir -p models
+	@echo "fetching $*"
+	@curl -fsSL --proto '=https' -o models/$*.part $(MODEL_URL_$*)
+	@expected=$$(awk -v name="$*" '$$2 == name { print $$1 }' models.sha256); \
+	 actual=$$(sha256sum < models/$*.part | cut -d' ' -f1); \
+	 if [ "$$expected" != "$$actual" ]; then \
+	   echo "$*: checksum mismatch (expected $$expected, got $$actual)" >&2; \
+	   rm -f models/$*.part; exit 1; \
+	 fi
+	@mv models/$*.part models/$*
 
 # Everything the card's FAT32 boot partition needs: the Raspberry Pi boot
 # firmware, config.txt, and the rpi-loader image renamed to $(KERNEL) --

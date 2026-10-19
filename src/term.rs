@@ -33,6 +33,24 @@ pub fn write(args: fmt::Arguments) {
     });
 }
 
+/// Writes raw bytes to the terminal, with each `\n` sent as `\r\n`.
+///
+/// For text that is not known to be whole UTF-8 — a token can be half of a
+/// multi-byte character, the other half arriving with the next one — and
+/// that uses bare newlines, as the model's output does. A serial terminal
+/// does not translate line endings, so a bare `\n` there moves down a
+/// line without returning to the start of it.
+pub fn write_bytes(bytes: &[u8]) {
+    with(|uart| {
+        for &byte in bytes {
+            if byte == b'\n' {
+                uart.write_byte(b'\r');
+            }
+            uart.write_byte(byte);
+        }
+    });
+}
+
 /// Runs `f` on the terminal's UART with the lock held, so that several
 /// writes go out together. Does nothing before [`init`].
 fn with(f: impl FnOnce(&mut Uart)) {
@@ -112,8 +130,7 @@ impl<'a> Progress<'a> {
     /// Writes the line for `done` bytes at `now`, under one hold of the
     /// lock.
     ///
-    /// All integer arithmetic: the build is soft-float, and nothing here
-    /// needs more than tenths.
+    /// All integer arithmetic, since nothing here needs more than tenths.
     fn draw(&self, done: u64, now: u64) {
         let elapsed = (now - self.started).max(1);
         let filled = (done * BAR).checked_div(self.total).unwrap_or(BAR);

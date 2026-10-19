@@ -2,3 +2,6 @@
 # What `make sd-card` fetches. config.txt is this project's own.
 /sd-card/*
 !/sd-card/config.txt
+# What `make models` fetches: tens of megabytes and up, not source.
+/models/*
+!/models.sha256
