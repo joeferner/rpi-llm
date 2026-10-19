@@ -322,6 +322,45 @@ impl<'a> Gguf<'a> {
     pub fn tensors(&self) -> &[Tensor<'a>] {
         &self.tensors
     }
+
+    /// Repacks every Q8_0 tensor in `file` in place for computing with
+    /// (see [`crate::quant`]), then parses it.
+    ///
+    /// Only what this returns can be handed to
+    /// [`crate::model::Weights::from_gguf`], so a model cannot be built
+    /// over blocks still in the file's layout: they would be read as
+    /// garbage, not rejected.
+    ///
+    /// Repacking needs scratch space the size of the largest Q8_0 tensor,
+    /// for as long as it takes to rearrange that tensor.
+    pub fn parse_repacked(file: &'a mut [u8]) -> Result<Repacked<'a>, GgufError> {
+        let ranges: Vec<(usize, usize)> = Gguf::parse(file)?
+            .tensors
+            .iter()
+            .filter(|t| t.kind == TensorType::Q8_0)
+            .map(|t| {
+                let start = t.data.as_ptr() as usize - file.as_ptr() as usize;
+                (start, start + t.data.len())
+            })
+            .collect();
+        for (start, end) in ranges {
+            crate::quant::repack(&mut file[start..end]);
+        }
+        let file: &'a [u8] = file;
+        Ok(Repacked(Gguf::parse(file)?))
+    }
+}
+
+/// A GGUF file whose Q8_0 tensors [`Gguf::parse_repacked`] has repacked.
+/// Everything else reads as through the [`Gguf`] it dereferences to.
+pub struct Repacked<'a>(Gguf<'a>);
+
+impl<'a> core::ops::Deref for Repacked<'a> {
+    type Target = Gguf<'a>;
+
+    fn deref(&self) -> &Gguf<'a> {
+        &self.0
+    }
 }
 
 /// A cursor over the file's bytes.

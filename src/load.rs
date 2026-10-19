@@ -41,8 +41,9 @@ impl Blob {
         unsafe { core::slice::from_raw_parts(self.lines.as_ptr().cast(), self.len) }
     }
 
-    /// The file's bytes, writable: what [`load`] reads into.
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    /// The file's bytes, writable: what [`load`] reads into, and what
+    /// repacking a model in place needs.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as in `bytes`, and `&mut self` makes it the only view.
         unsafe { core::slice::from_raw_parts_mut(self.lines.as_mut_ptr().cast(), self.len) }
     }

@@ -105,8 +105,8 @@ fn story_reference() -> (Vec<u32>, Vec<u32>) {
 
 #[test]
 fn model_agrees_with_llama_cpp_token_by_token() {
-    let Some(file) = load() else { return };
-    let gguf = Gguf::parse(file.bytes()).unwrap();
+    let Some(mut file) = load() else { return };
+    let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
     let bpe = Bpe::from_gguf(&gguf).unwrap();
     let (config, weights) = Weights::from_gguf(&gguf).unwrap();
     let (prompt, expected) = story_reference();
@@ -163,8 +163,8 @@ fn model_agrees_with_llama_cpp_token_by_token() {
 /// the file.
 #[test]
 fn free_running_generation_matches_the_recorded_engine_output() {
-    let Some(file) = load() else { return };
-    let gguf = Gguf::parse(file.bytes()).unwrap();
+    let Some(mut file) = load() else { return };
+    let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
     let bpe = Bpe::from_gguf(&gguf).unwrap();
     let (config, weights) = Weights::from_gguf(&gguf).unwrap();
 

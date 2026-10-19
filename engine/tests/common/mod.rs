@@ -21,6 +21,13 @@ impl Aligned {
         // SAFETY: `words` holds at least `len` bytes, all initialised.
         unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.len) }
     }
+
+    /// The file's bytes, writable: what repacking a GGUF file needs.
+    #[allow(dead_code, reason = "not every test file repacks")]
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `bytes`, and `&mut self` makes it the only view.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.len) }
+    }
 }
 
 /// Reads `name` from `models/`; `None` if it is not there.

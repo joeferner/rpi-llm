@@ -112,13 +112,11 @@ A serial terminal over the RP1 UART0 (GPIO14/15):
 
 ## Build order
 
-1. NEON `sdot` matrix multiply, over Q8_0 weights repacked at load time
-   into an aligned layout. The board's target is `strict-align`, so the
-   file's 34-byte blocks leave every block's weights unaligned and the
-   compiler assembles them a byte at a time: SmolLM2 runs at 2.8 tok/s on
-   the Pi against about 17 on an x86 desktop with the same code.
-2. The parallel matrix multiply across all 4 cores.
-3. Fan control, then the side-by-side benchmark against llama.cpp on
+1. The parallel matrix multiply across all 4 cores. One core with NEON
+   `sdot` already runs SmolLM2 at 19.4 tok/s, reading about 7 GB/s of
+   weights, close to what the Pi 5's memory delivers in practice — so
+   expect well under 4x from four cores, and measure the bandwidth first.
+2. Fan control, then the side-by-side benchmark against llama.cpp on
    Raspberry Pi OS.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

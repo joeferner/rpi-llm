@@ -17,9 +17,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::gguf::{Gguf, Tensor, TensorType};
+use crate::gguf::{Gguf, Repacked, Tensor, TensorType};
 use crate::llama2::{self, FormatError, HEADER_BYTES};
-use crate::quant::{self, BLOCK, BLOCK_BYTES, Quantized};
+use crate::quant::{self, BLOCK, Block, Quantized};
 
 /// A model's shape and the constants its arithmetic needs.
 #[derive(Clone, Copy, Debug)]
@@ -109,10 +109,12 @@ pub enum Matrix<'a> {
         /// Elements per row.
         cols: usize,
     },
-    /// Q8_0 blocks, `cols / 32` per row.
+    /// Q8_0, repacked (see [`crate::quant`]): `cols / 32` blocks per row.
     Q8_0 {
-        /// The blocks, as stored.
-        data: &'a [u8],
+        /// Every block's values, row by row.
+        values: &'a [Block],
+        /// Every block's `f16` scale, in the same order.
+        scales: &'a [u16],
         /// Elements per row.
         cols: usize,
     },
@@ -130,9 +132,13 @@ impl Matrix<'_> {
     fn row_into(&self, i: usize, out: &mut [f32]) {
         match *self {
             Self::F32 { data, cols } => out.copy_from_slice(&data[i * cols..(i + 1) * cols]),
-            Self::Q8_0 { data, cols } => {
-                let bytes = cols / BLOCK * BLOCK_BYTES;
-                quant::dequantize(&data[i * bytes..(i + 1) * bytes], out);
+            Self::Q8_0 {
+                values,
+                scales,
+                cols,
+            } => {
+                let row = cols / BLOCK * i..cols / BLOCK * (i + 1);
+                quant::dequantize(&values[row.clone()], &scales[row], out);
             }
         }
     }
@@ -257,7 +263,10 @@ impl<'a> Weights<'a> {
     /// The RoPE pairing needs no handling here: llama.cpp's converter
     /// permutes the query and key weights so that GGUF `llama` models
     /// rotate adjacent pairs, as llama2.c's checkpoints do.
-    pub fn from_gguf(gguf: &Gguf<'a>) -> Result<(Config, Self), ModelError> {
+    ///
+    /// Takes the file as [`Gguf::parse_repacked`] returns it, since Q8_0
+    /// tensors are computed with in the repacked layout.
+    pub fn from_gguf(gguf: &Repacked<'a>) -> Result<(Config, Self), ModelError> {
         let arch = gguf
             .string("general.architecture")
             .ok_or(ModelError::Metadata("general.architecture"))?;
@@ -304,7 +313,13 @@ impl<'a> Weights<'a> {
                     cols,
                 }),
                 TensorType::Q8_0 if cols.is_multiple_of(BLOCK) => {
-                    Ok(Matrix::Q8_0 { data: t.data, cols })
+                    let (values, scales) = quant::repacked(t.data)
+                        .ok_or_else(|| ModelError::Misaligned(name.into()))?;
+                    Ok(Matrix::Q8_0 {
+                        values,
+                        scales,
+                        cols,
+                    })
                 }
                 _ => Err(ModelError::Unsupported(name.into())),
             }
@@ -582,10 +597,9 @@ fn softmax(x: &mut [f32]) {
 
 /// `out = w @ x`, one output per row of `w`.
 ///
-/// Where nearly all the time goes, and where the faster versions will go:
-/// these are the plain loops the references have, kept as what those are
-/// checked against. A Q8_0 matrix quantizes `x` into `scratch` first, as
-/// ggml does.
+/// Where nearly all the time goes. An F32 matrix is the plain loop llama2.c
+/// has; a Q8_0 matrix quantizes `x` into `scratch` first, as ggml does, and
+/// takes each row's dot product with [`quant::dot`].
 fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, scratch: &mut Quantized) {
     match *w {
         Matrix::F32 { data, cols } => {
@@ -593,11 +607,19 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, scratch: &mut Quantized) {
                 *o = dot(&data[i * cols..(i + 1) * cols], x);
             }
         }
-        Matrix::Q8_0 { data, cols } => {
+        Matrix::Q8_0 {
+            values,
+            scales,
+            cols,
+        } => {
             quant::quantize(x, scratch);
-            let bytes = cols / BLOCK * BLOCK_BYTES;
-            for (o, row) in out.iter_mut().zip(data.chunks_exact(bytes)) {
-                *o = quant::dot(row, scratch);
+            let per_row = cols / BLOCK;
+            for ((o, row), row_scales) in out
+                .iter_mut()
+                .zip(values.chunks_exact(per_row))
+                .zip(scales.chunks_exact(per_row))
+            {
+                *o = quant::dot(row, row_scales, scratch);
             }
         }
     }

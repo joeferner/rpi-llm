@@ -109,17 +109,22 @@ pub extern "C" fn kmain() -> ! {
         Err(e) => fail(format_args!("storage: {e:?}")),
     };
 
-    let (file, elapsed) = match load::load(&mut volume, MODEL, &timer) {
+    let (mut file, elapsed) = match load::load(&mut volume, MODEL, &timer) {
         Ok(loaded) => loaded,
         Err(e) => fail(format_args!("{MODEL}: {e:?}")),
     };
     report_load(MODEL, file.bytes().len(), elapsed);
     report_checksum(MODEL, file.bytes(), &timer);
 
-    let gguf = match Gguf::parse(file.bytes()) {
+    let started = timer.now_micros();
+    let gguf = match Gguf::parse_repacked(file.bytes_mut()) {
         Ok(gguf) => gguf,
         Err(e) => fail(format_args!("{MODEL}: {e:?}")),
     };
+    logln!(
+        "model: Q8_0 tensors repacked in {} ms",
+        (timer.now_micros() - started) / 1000
+    );
     let bpe = match Bpe::from_gguf(&gguf) {
         Ok(bpe) => bpe,
         Err(e) => fail(format_args!("{MODEL}: tokenizer: {e:?}")),
