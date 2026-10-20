@@ -552,12 +552,14 @@ mod neon {
         out
     }
 
-    /// [`super::gemm4`] with `sdot` by element: four rows by four tokens.
+    /// [`super::gemm4`] with `sdot` by element: four rows by eight tokens
+    /// at a time, and four by four for a leftover group.
     ///
-    /// Per block: the four rows' quad and the four tokens' quad, eight
-    /// groups each, and 32 `sdot`s — group `k` of the rows times group `k`
-    /// of token `m` (lane `m`) into token `m`'s accumulator, whose lanes are
-    /// the rows. Each load serves four `sdot`s, and nothing is reduced.
+    /// Eight tokens rather than four because of `sdot`'s latency: one
+    /// group's 32 `sdot`s per block are four chains (a token's accumulator
+    /// each) eight deep, too few to keep both vector pipes busy, and they
+    /// waited. Two groups make eight chains, and each weight load and
+    /// scale conversion serves twice the work.
     #[target_feature(enable = "dotprod")]
     pub(super) unsafe fn gemm4(
         values: &[Quad],
@@ -566,53 +568,69 @@ mod neon {
         out: &mut [[f32; 4]],
     ) {
         let groups_n = x.tokens / 4;
+        let mut g = 0;
         unsafe {
-            for g in 0..groups_n {
-                let mut acc = [vdupq_n_f32(0.0); 4];
-                for (b, (quad, s)) in values.iter().zip(scales).enumerate() {
-                    let w = groups(quad);
-                    let at = b * groups_n + g;
-                    let t = groups(&x.values[at]);
-                    let mut sums = [vdupq_n_s32(0); 4];
-                    for k in 0..8 {
-                        sums[0] = vdotq_laneq_s32::<0>(sums[0], w[k], t[k]);
-                        sums[1] = vdotq_laneq_s32::<1>(sums[1], w[k], t[k]);
-                        sums[2] = vdotq_laneq_s32::<2>(sums[2], w[k], t[k]);
-                        sums[3] = vdotq_laneq_s32::<3>(sums[3], w[k], t[k]);
+            while g + 2 <= groups_n {
+                tile::<2>(values, scales, x, g, out);
+                g += 2;
+            }
+            if g < groups_n {
+                tile::<1>(values, scales, x, g, out);
+            }
+        }
+    }
+
+    /// Four rows by token groups `first..first + G`.
+    ///
+    /// Per block: the four rows' quad, each group's quad, and 32 `sdot`s per
+    /// group — group `k` of the rows times group `k` of token `m` (lane `m`)
+    /// into token `m`'s accumulator, whose lanes are the rows. Nothing is
+    /// reduced, and each (row, token) result is scaled and added block by
+    /// block exactly as [`dot4`] does.
+    #[inline(always)]
+    unsafe fn tile<const G: usize>(
+        values: &[Quad],
+        scales: &[QuadScales],
+        x: &Batch,
+        first: usize,
+        out: &mut [[f32; 4]],
+    ) {
+        let groups_n = x.tokens / 4;
+        unsafe {
+            let mut acc = [[vdupq_n_f32(0.0); 4]; G];
+            for (b, (quad, s)) in values.iter().zip(scales).enumerate() {
+                let w = groups(quad);
+                let at = b * groups_n + first;
+                let mut sums = [[vdupq_n_s32(0); 4]; G];
+                for (k, &wk) in w.iter().enumerate() {
+                    for (h, sums) in sums.iter_mut().enumerate() {
+                        let t = groups(&x.values[at + h])[k];
+                        sums[0] = vdotq_laneq_s32::<0>(sums[0], wk, t);
+                        sums[1] = vdotq_laneq_s32::<1>(sums[1], wk, t);
+                        sums[2] = vdotq_laneq_s32::<2>(sums[2], wk, t);
+                        sums[3] = vdotq_laneq_s32::<3>(sums[3], wk, t);
                     }
-                    let dw = widen(s);
-                    let dx: float32x4_t = *(&x.scales[at] as *const Scales).cast();
-                    acc[0] = vaddq_f32(
-                        acc[0],
-                        vmulq_f32(
-                            vcvtq_f32_s32(sums[0]),
-                            vmulq_f32(dw, vdupq_laneq_f32::<0>(dx)),
-                        ),
-                    );
-                    acc[1] = vaddq_f32(
-                        acc[1],
-                        vmulq_f32(
-                            vcvtq_f32_s32(sums[1]),
-                            vmulq_f32(dw, vdupq_laneq_f32::<1>(dx)),
-                        ),
-                    );
-                    acc[2] = vaddq_f32(
-                        acc[2],
-                        vmulq_f32(
-                            vcvtq_f32_s32(sums[2]),
-                            vmulq_f32(dw, vdupq_laneq_f32::<2>(dx)),
-                        ),
-                    );
-                    acc[3] = vaddq_f32(
-                        acc[3],
-                        vmulq_f32(
-                            vcvtq_f32_s32(sums[3]),
-                            vmulq_f32(dw, vdupq_laneq_f32::<3>(dx)),
-                        ),
-                    );
                 }
+                let dw = widen(s);
+                for (h, (acc, sums)) in acc.iter_mut().zip(&sums).enumerate() {
+                    let dx: float32x4_t = *(&x.scales[at + h] as *const Scales).cast();
+                    let dxs = [
+                        vdupq_laneq_f32::<0>(dx),
+                        vdupq_laneq_f32::<1>(dx),
+                        vdupq_laneq_f32::<2>(dx),
+                        vdupq_laneq_f32::<3>(dx),
+                    ];
+                    for m in 0..4 {
+                        acc[m] = vaddq_f32(
+                            acc[m],
+                            vmulq_f32(vcvtq_f32_s32(sums[m]), vmulq_f32(dw, dxs[m])),
+                        );
+                    }
+                }
+            }
+            for (h, acc) in acc.iter().enumerate() {
                 for (m, acc) in acc.iter().enumerate() {
-                    vst1q_f32(out[4 * g + m].as_mut_ptr(), *acc);
+                    vst1q_f32(out[4 * (first + h) + m].as_mut_ptr(), *acc);
                 }
             }
         }
@@ -727,8 +745,9 @@ mod tests {
         let (values, scales) = repacked(tensor).unwrap();
         let per_row = COLS / BLOCK;
 
-        // Six tokens: one full group of four and a padded one.
-        let xs: Vec<f32> = (0..6 * COLS).map(|i| (i as f32 * 0.37).sin()).collect();
+        // Ten tokens: two full groups of four, which the NEON kernel takes
+        // together, and a padded one it takes alone.
+        let xs: Vec<f32> = (0..10 * COLS).map(|i| (i as f32 * 0.37).sin()).collect();
         let mut batch = Batch::default();
         quantize_batch(&crate::parallel::Serial, &xs, COLS, &mut batch);
         let mut q = Quantized::default();

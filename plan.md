@@ -138,11 +138,13 @@ cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
 
 ## Build order
 
-1. Close the rest of the prompt gap: 231.0 tok/s against llama.cpp's 261.
-   The prompt's 149.3 ms is now matmul 114.9, other 19.1, quantize 9.1,
-   attention 6.1. The 4x4 kernel runs about 112 G multiply-adds/s, a
-   third of the four cores' `sdot` peak: benchmark it alone and read its
-   inner loop before changing it.
+1. Close the rest of the prompt gap: 241.3 tok/s against llama.cpp's 261.
+   The prompt's 141.6 ms is now matmul 107.0, other 19.3, quantize 9.2,
+   attention 6.1. The 4x8 kernel takes about 38 cycles per 4x4 block
+   against a floor of about 25 from its instruction count; its `sdot`
+   latency chains were only part of that (114.9 -> 107.0 ms). Benchmark
+   it alone on the board (L1-hot, real shapes, four cores) to find the
+   rest: the 2560-column matrix's tokens (127 KB) don't fit in L1.
 2. Fan control, then rerun the baseline above for the final side-by-side.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

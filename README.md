@@ -66,12 +66,12 @@ models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  11
 Write a short story about a robot who learns to paint.<|im_end|>
 <|im_start|>assistant
 Once upon a time, there was a robot named Robo who was very smart ...
-[   42.268] chat: prompt 42 tokens in 0.18 s, 231.0 tok/s
-[   42.271] chat: answer 200 tokens in 6.71 s, 29.7 tok/s
-[   42.277] phases: prompt: 1 calls in 149.3 ms: quantize 9.1, matmul 114.9, attention 6.1, other 19.1
-[   42.286] phases: answer: 200 calls in 6725.5 ms: quantize 135.4, matmul 5998.6, attention 423.0, other 168.5
+[   42.236] chat: prompt 42 tokens in 0.17 s, 241.3 tok/s
+[   42.239] chat: answer 200 tokens in 6.68 s, 29.8 tok/s
+[   42.244] phases: prompt: 1 calls in 141.6 ms: quantize 9.2, matmul 107.0, attention 6.1, other 19.3
+[   42.253] phases: answer: 200 calls in 6696.3 ms: quantize 135.0, matmul 5973.8, attention 421.1, other 166.4
 ...
-[   42.321] reference: all 200 tokens match the host engine
+[   42.288] reference: all 200 tokens match the host engine
 ```
 
 `make test` runs the engine's tests on the development machine (the
@@ -90,7 +90,7 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 
 | | Load | Prompt | Answer |
 |---|---|---|---|
-| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 231.0 tok/s | 29.7 tok/s |
+| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 241.3 tok/s | 29.8 tok/s |
 | rpi-llm, Linux, 4 threads | 4.37 s (88 MB/s) | 27.6 tok/s | 25.9 tok/s |
 | rpi-llm, Linux, 1 thread | 4.42 s | 26.0 tok/s | 22.3 tok/s |
 | llama.cpp, Linux, 4 threads | 5.05 s (77 MB/s) | 261.3 tok/s | 25.2 tok/s |
@@ -107,9 +107,10 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
   defaults; `rpi-llm` on Linux is the same engine as the board's, built as
   an ordinary program ([bench/](bench/)).
 - The `rpi-llm` Linux rows were measured before the engine batched its
-  prompt; the bare-metal row is with batching, the 4x4 kernel, the
-  per-token work spread across the cores and NEON attention (it was 28.5
-  tok/s for the prompt and 25.5 for the answer before all four).
+  prompt; the bare-metal row is with batching, the 4x4 and then 4x8
+  kernels, the per-token work spread across the cores and NEON attention
+  (it was 28.5 tok/s for the prompt and 25.5 for the answer before all
+  of them).
 - The `phases:` lines split the time inside the model: quantizing
   activations to 8 bits, the weight matrix multiplies, attention, and
   everything else (normalization, RoPE, SwiGLU, residual adds).
@@ -133,8 +134,10 @@ What the numbers say:
   four cores, quantizing each shared input once, and rounding with the
   hardware's instruction took it to 203.3. Attention in NEON, with the
   prompt's (token, head) pairs dealt out one at a time so that the
-  longest histories don't all land on one core, took it to 231.0; the
-  matrix multiplies are now three quarters of the prompt's time.
+  longest histories don't all land on one core, took it to 231.0.
+  Widening the kernel's tile to 4 rows by 8 tokens, so that its `sdot`s
+  run as eight independent chains rather than four, took it to 241.3;
+  the matrix multiplies are now three quarters of the prompt's time.
 - **The load is 7x behind Linux**, whose SD driver runs the card in a
   fast UHS mode while rpi-hal's stays at default speed.
 
