@@ -140,11 +140,14 @@ cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
 
 1. Close the rest of the prompt gap: 241.3 tok/s against llama.cpp's 261.
    The prompt's 141.6 ms is now matmul 107.0, other 19.3, quantize 9.2,
-   attention 6.1. The 4x8 kernel takes about 38 cycles per 4x4 block
-   against a floor of about 25 from its instruction count; its `sdot`
-   latency chains were only part of that (114.9 -> 107.0 ms). Benchmark
-   it alone on the board (L1-hot, real shapes, four cores) to find the
-   rest: the 2560-column matrix's tokens (127 KB) don't fit in L1.
+   attention 6.1. `make kernel` puts the 4x8 kernel at about 30.7 cycles
+   per 4x4 block whatever the shape, token count or core count (floor
+   about 25 from its instruction count), which is 86.5 ms of the 107.0:
+   - Fold the prompt's last token into the batch, computing logits only
+     for its row. It goes through `forward` alone today, memory-bound,
+     about 33 ms of the prompt's 174; batched, about 7. Expected about
+     280 tok/s.
+   - Then find the 20 ms `matmul_batch` spends outside the kernel.
 2. Fan control, then rerun the baseline above for the final side-by-side.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

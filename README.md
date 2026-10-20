@@ -80,7 +80,10 @@ runs the same tests built for 64-bit Arm under `qemu-aarch64`, so the
 NEON code the board runs is checked against the same references (it
 needs `qemu-aarch64` and `rustup target add aarch64-unknown-linux-musl`,
 and takes a few minutes). `make bandwidth`
-runs a memory bandwidth measurement on the board instead of the model.
+runs a memory bandwidth measurement on the board instead of the model,
+and `make kernel` times the prompt's matrix multiply kernel alone, in
+cycles per 4-row by 4-token block (about 30 on one core or four, with
+the tokens in L1 or not).
 
 ## Performance
 
