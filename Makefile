@@ -4,6 +4,7 @@
 #   make run DEVICE=/dev/ttyUSB0  build it, upload it over the UART with
 #                                 rpi-loader, and boot it
 #   make test                     the engine's tests, on this machine
+#   make test-arm                 the same, as Arm code under qemu (NEON)
 #   make models                   fetch the model files into models/, for
 #                                 the tests and for the card's models/
 #   make sd-card                  fetch what goes on the SD card into
@@ -31,7 +32,7 @@ MODEL_URL_stories15M.bin := https://huggingface.co/karpathy/tinyllamas/resolve/m
 MODEL_URL_tokenizer.bin := https://raw.githubusercontent.com/karpathy/llama2.c/350e04f/tokenizer.bin
 MODEL_URL_smollm2-360m-instruct-q8_0.gguf := https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q8_0.gguf
 
-.PHONY: all build run bandwidth test models sd-card clean
+.PHONY: all build run bandwidth test test-arm models sd-card clean
 
 # The host's own target, which `make test` builds the engine for:
 # `.cargo/config.toml` points plain `cargo` at the board.
@@ -58,6 +59,17 @@ bandwidth:
 # without it.
 test:
 	cargo test --release -p rpi-llm-engine --target $(HOST)
+
+# The same tests built for 64-bit Arm and run under qemu's user-mode
+# emulator, so that the NEON kernels the board runs are checked against
+# the same references; the host's own build runs the scalar ones. Needs
+# qemu-aarch64 and `rustup target add aarch64-unknown-linux-musl`; links
+# with rust-lld, so no cross C toolchain. A few minutes: qemu is slow.
+ARM_TEST := aarch64-unknown-linux-musl
+test-arm:
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64 \
+	cargo test --release -p rpi-llm-engine --target $(ARM_TEST)
 
 # The model files, for the tests and for copying onto the card's models/.
 models: $(addprefix models/,$(MODEL_FILES))

@@ -66,16 +66,20 @@ models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  11
 Write a short story about a robot who learns to paint.<|im_end|>
 <|im_start|>assistant
 Once upon a time, there was a robot named Robo who was very smart ...
-[   42.604] chat: prompt 42 tokens in 0.21 s, 203.3 tok/s
-[   42.607] chat: answer 200 tokens in 7.02 s, 28.4 tok/s
-[   42.612] phases: prompt: 1 calls in 173.5 ms: quantize 9.2, matmul 115.5, attention 29.5, other 19.2
-[   42.621] phases: answer: 200 calls in 7032.3 ms: quantize 136.4, matmul 5975.2, attention 755.6, other 165.2
+[   42.268] chat: prompt 42 tokens in 0.18 s, 231.0 tok/s
+[   42.271] chat: answer 200 tokens in 6.71 s, 29.7 tok/s
+[   42.277] phases: prompt: 1 calls in 149.3 ms: quantize 9.1, matmul 114.9, attention 6.1, other 19.1
+[   42.286] phases: answer: 200 calls in 6725.5 ms: quantize 135.4, matmul 5998.6, attention 423.0, other 168.5
 ...
-[   42.656] reference: all 200 tokens match the host engine
+[   42.321] reference: all 200 tokens match the host engine
 ```
 
 `make test` runs the engine's tests on the development machine (the
-ones that need model files skip without `make models`). `make bandwidth`
+ones that need model files skip without `make models`). `make test-arm`
+runs the same tests built for 64-bit Arm under `qemu-aarch64`, so the
+NEON code the board runs is checked against the same references (it
+needs `qemu-aarch64` and `rustup target add aarch64-unknown-linux-musl`,
+and takes a few minutes). `make bandwidth`
 runs a memory bandwidth measurement on the board instead of the model.
 
 ## Performance
@@ -86,7 +90,7 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 
 | | Load | Prompt | Answer |
 |---|---|---|---|
-| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 203.3 tok/s | 28.4 tok/s |
+| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 231.0 tok/s | 29.7 tok/s |
 | rpi-llm, Linux, 4 threads | 4.37 s (88 MB/s) | 27.6 tok/s | 25.9 tok/s |
 | rpi-llm, Linux, 1 thread | 4.42 s | 26.0 tok/s | 22.3 tok/s |
 | llama.cpp, Linux, 4 threads | 5.05 s (77 MB/s) | 261.3 tok/s | 25.2 tok/s |
@@ -103,9 +107,9 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
   defaults; `rpi-llm` on Linux is the same engine as the board's, built as
   an ordinary program ([bench/](bench/)).
 - The `rpi-llm` Linux rows were measured before the engine batched its
-  prompt; the bare-metal row is with batching, the 4x4 kernel and the
-  per-token work spread across the cores (it was 28.5 tok/s for the
-  prompt and 25.5 for the answer before all three).
+  prompt; the bare-metal row is with batching, the 4x4 kernel, the
+  per-token work spread across the cores and NEON attention (it was 28.5
+  tok/s for the prompt and 25.5 for the answer before all four).
 - The `phases:` lines split the time inside the model: quantizing
   activations to 8 bits, the weight matrix multiplies, attention, and
   everything else (normalization, RoPE, SwiGLU, residual adds).
@@ -118,7 +122,7 @@ What the numbers say:
   read at most 13.9 GB/s (one alone reads 14.0), which `make bandwidth`
   measures. Splitting each matrix's rows across the cores in interleaved
   4 KiB chunks rather than contiguous quarters is what gets near that.
-- **The prompt is 1.3x behind llama.cpp.** Both push all the prompt's
+- **The prompt is 1.1x behind llama.cpp.** Both push all the prompt's
   tokens through each weight matrix together, so each weight is read once
   for the whole prompt, and both use the same kernel layout: four rows'
   weights interleaved so that one `sdot` serves four rows of one token, in
@@ -127,7 +131,10 @@ What the numbers say:
   of the rest running on core 0 alone: quantizing the activations, and
   the per-token normalization, RoPE and SwiGLU. Moving those onto all
   four cores, quantizing each shared input once, and rounding with the
-  hardware's instruction took it to 203.3.
+  hardware's instruction took it to 203.3. Attention in NEON, with the
+  prompt's (token, head) pairs dealt out one at a time so that the
+  longest histories don't all land on one core, took it to 231.0; the
+  matrix multiplies are now three quarters of the prompt's time.
 - **The load is 7x behind Linux**, whose SD driver runs the card in a
   fast UHS mode while rpi-hal's stays at default speed.
 

@@ -17,6 +17,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::attention::{self, Floats, dot};
 use crate::gguf::{Gguf, Repacked, Tensor, TensorType};
 use crate::llama2::{self, FormatError, HEADER_BYTES};
 use crate::parallel::{Serial, Shared, Workers, for_chunks, for_each, for_rows};
@@ -411,10 +412,10 @@ pub struct Transformer<'a> {
     /// The output, `(vocab_size,)`.
     logits: Vec<f32>,
     /// Keys for every layer and position so far, `(n_layers, context,
-    /// kv_dim)`.
-    key_cache: Vec<f32>,
+    /// kv_dim)`, aligned for attention's NEON loads.
+    key_cache: Floats,
     /// Values, laid out as `key_cache`.
-    value_cache: Vec<f32>,
+    value_cache: Floats,
     /// What every matrix multiply needs besides its operands.
     mm: MatMul<'a>,
     /// [`Self::prefill`]'s buffers.
@@ -515,8 +516,8 @@ impl<'a> Transformer<'a> {
             q: vec![0.0; config.dim],
             att: vec![0.0; config.n_heads * context],
             logits: vec![0.0; config.vocab_size],
-            key_cache: vec![0.0; cache],
-            value_cache: vec![0.0; cache],
+            key_cache: Floats::zeroed(cache),
+            value_cache: Floats::zeroed(cache),
             batch: BatchBuffers::default(),
             mm: MatMul {
                 scratch: Quantized::default(),
@@ -635,7 +636,7 @@ impl<'a> Transformer<'a> {
             let scale = libm::sqrtf(head_size as f32);
             let scores = Shared::new(&mut self.att);
             let outputs = Shared::new(&mut self.xb);
-            let (queries, keys, values) = (&self.q, &self.key_cache, &self.value_cache);
+            let (queries, keys, values) = (&self.q, &*self.key_cache, &*self.value_cache);
             for_each(self.mm.workers, c.n_heads, |h| {
                 let q = &queries[h * head_size..(h + 1) * head_size];
                 // SAFETY: head `h`'s scores and its slice of `xb` are
@@ -647,20 +648,10 @@ impl<'a> Transformer<'a> {
                         outputs.slice(h * head_size, head_size),
                     )
                 };
-                let kv_head = (h / kv_mul) * head_size;
-                for (t, score) in att.iter_mut().enumerate() {
-                    let at = base + t * kv_dim + kv_head;
-                    *score = dot(q, &keys[at..at + head_size]) / scale;
-                }
+                let at = base + (h / kv_mul) * head_size;
+                attention::scores(q, &keys[at..], kv_dim, scale, att);
                 softmax(att);
-
-                xb.fill(0.0);
-                for (t, &a) in att.iter().enumerate() {
-                    let at = base + t * kv_dim + kv_head;
-                    for (out, &v) in xb.iter_mut().zip(&values[at..at + head_size]) {
-                        *out += a * v;
-                    }
-                }
+                attention::weighted_sum(att, &values[at..], kv_dim, xb);
             });
             let attention_ended = self.mm.now();
             self.mm.phases().attention += attention_ended - attention_started;
@@ -847,8 +838,11 @@ impl<'a> Transformer<'a> {
             let scale = libm::sqrtf(head_size as f32);
             let scores = Shared::new(&mut att[..n * c.n_heads * ctx]);
             let outputs = Shared::new(xb);
-            let (queries, keys, values) = (&*q, &self.key_cache, &self.value_cache);
-            for_each(workers, n * c.n_heads, |i| {
+            let (queries, keys, values) = (&*q, &*self.key_cache, &*self.value_cache);
+            // Dealt out one pair at a time rather than in contiguous runs:
+            // a later token attends over more positions, and contiguous
+            // runs would give the last worker the batch's longest ones.
+            for_chunks(workers, n * c.n_heads, 1, |i| {
                 let (t, h) = (i / c.n_heads, i % c.n_heads);
                 let pos = pos0 + t;
                 let qh = &queries[t * dim + h * head_size..t * dim + (h + 1) * head_size];
@@ -860,20 +854,10 @@ impl<'a> Transformer<'a> {
                         outputs.slice(t * dim + h * head_size, head_size),
                     )
                 };
-                let kv_head = (h / kv_mul) * head_size;
-                for (s, score) in att.iter_mut().enumerate() {
-                    let at = base + s * kv_dim + kv_head;
-                    *score = dot(qh, &keys[at..at + head_size]) / scale;
-                }
+                let at = base + (h / kv_mul) * head_size;
+                attention::scores(qh, &keys[at..], kv_dim, scale, att);
                 softmax(att);
-
-                out.fill(0.0);
-                for (s, &a) in att.iter().enumerate() {
-                    let at = base + s * kv_dim + kv_head;
-                    for (o, &v) in out.iter_mut().zip(&values[at..at + head_size]) {
-                        *o += a * v;
-                    }
-                }
+                attention::weighted_sum(att, &values[at..], kv_dim, out);
             });
             let attention_ended = self.mm.now();
             self.mm.phases().attention += attention_ended - attention_started;
@@ -1171,15 +1155,6 @@ fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul, input:
         }
     }
     mm.book(started, quantizing);
-}
-
-/// A left-to-right dot product.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for (&a, &b) in a.iter().zip(b) {
-        sum += a * b;
-    }
-    sum
 }
 
 /// Rotates the pair `v` by the angle whose cosine and sine are given.

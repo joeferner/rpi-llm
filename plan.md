@@ -138,11 +138,11 @@ cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
 
 ## Build order
 
-1. Close the rest of the prompt gap: 203.3 tok/s against llama.cpp's 261.
-   The prompt's 173.5 ms is now matmul 115.5, attention 29.5, other 19.2,
-   quantize 9.2. Attention is still scalar code, and is also the largest
-   cost in generation outside the multiplies (756 ms of 7032, 28.4
-   tok/s): vectorize it with NEON first, then look at the 4x4 kernel.
+1. Close the rest of the prompt gap: 231.0 tok/s against llama.cpp's 261.
+   The prompt's 149.3 ms is now matmul 114.9, other 19.1, quantize 9.1,
+   attention 6.1. The 4x4 kernel runs about 112 G multiply-adds/s, a
+   third of the four cores' `sdot` peak: benchmark it alone and read its
+   inner loop before changing it.
 2. Fan control, then rerun the baseline above for the final side-by-side.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

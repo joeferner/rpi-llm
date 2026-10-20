@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+mod attention;
 pub mod bpe;
 pub mod generate;
 pub mod gguf;
