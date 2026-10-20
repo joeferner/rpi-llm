@@ -110,19 +110,45 @@ A serial terminal over the RP1 UART0 (GPIO14/15):
 - a `[42 tok, 18.3 tok/s, prompt 95 tok/s]` footer after each reply. That
   footer is the showcase number.
 
+## Baseline: Linux on the same Pi
+
+`bench/linux/run.sh` runs llama.cpp (commit `0ce8cd1`, its defaults, mmap
+off so the load is real) and this engine as a Linux program
+(`rpi-llm-bench`) on the same Pi 5, model and chat request, with the page
+cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
+`performance` governor, 2.4 GHz, not throttled; 2026-10-20:
+
+| | Load | Prompt | Answer |
+|---|---|---|---|
+| llama.cpp, Linux, 4 threads | 5.05 s (77 MB/s) | 261.3 tok/s | 25.2 tok/s |
+| llama.cpp, Linux, 1 thread | 5.01 s | 91.4 | 28.8 |
+| rpi-llm, Linux, 4 threads | 4.37 s (88 MB/s) | 27.6 | 25.9 |
+| rpi-llm, Linux, 1 thread | 4.42 s | 26.0 | 22.3 |
+| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 28.5 | 25.5 |
+
+- Generation is at parity: everything meets the same memory wall.
+- The prompt is 9x behind llama.cpp, which batches it.
+- The load is 7x behind Linux, whose SD driver runs the card in a fast
+  UHS mode; rpi-hal's stays at default speed.
+- llama.cpp's one-thread kernel (28.8) beats this engine's (22.3 on
+  Linux), and its four threads lose to its one.
+- This engine's one thread is faster on Linux (22.3) than it was on bare
+  metal (19.4): the Linux target is not `strict-align`, so code outside
+  the NEON kernel may still be paying for alignment on the board.
+
 ## Build order
 
-1. Batched prompt processing: feed the prompt's tokens through each
-   matrix together, so one pass over the weights serves many tokens. That
-   makes the prompt compute-bound instead of memory-bound, where four
-   cores can scale. Matrix multiplies and attention already run on all
-   four cores, and generation is memory-bound: 25.5 tok/s (19.4 on one
-   core), the matrix multiplies reading about 11 GB/s of the 13.9 GB/s
-   four cores reach when they interleave their reads 4 KiB at a time
-   (`make bandwidth`; contiguous quarters reach only 11.5). The prompt
-   runs at 28.5 tok/s, barely faster than generation.
-2. Fan control, then the side-by-side benchmark against llama.cpp on
-   Raspberry Pi OS.
+1. A 4-row by 4-token prompt kernel. The prompt is batched now
+   (`Transformer::prefill`): 89.9 tok/s, up from 28.5, against llama.cpp's
+   261. That is about a tenth of what four cores' `sdot` can do: each
+   weight block meets only four tokens, so every 8 `sdot`s take 10 vector
+   loads and 3 reductions. Interleaving four rows' weights in 4-byte
+   groups lets one `sdot` against one token's bytes produce four rows'
+   sums with no reduction, and a 4x4 tile reuses each load four times —
+   llama.cpp's layout for this. The integer sums stay exact and the
+   scaling unchanged, so it can stay bit-identical. Generation is
+   memory-bound at 26.0 tok/s and is not this step's to change.
+2. Fan control, then rerun the baseline above for the final side-by-side.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector
 
@@ -161,7 +187,8 @@ the board before this app uses it. This app uses `rpi-hal` by crate name,
 through a local `[patch.crates-io]` path while the work is in progress.
 
 - **Mapping RAM above 4 GiB**, for bigger models on 8 GB and 16 GB boards.
-- **Faster SD modes** (needs the switch to 1.8 V signalling), to cut SD
-  load time from about 15 s to about 4 s.
+- **Faster SD modes** (needs the switch to 1.8 V signalling): Linux reads
+  the same card at 88 MB/s against rpi-hal's 11.7, so SmolLM2 loads in
+  4.4 s there and 32.9 s on bare metal — the largest gap in the baseline.
 - **Stretch: PCIe root complex + NVMe driver**, for loading models from the
   SSD (see the stretch goal above).

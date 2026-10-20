@@ -219,6 +219,8 @@ fn chat(transformer: &mut Transformer, bpe: &Bpe, timer: &Timer) -> Vec<u32> {
     let mut ids = Vec::new();
     let mut piece = Vec::new();
     let started = timer.now_micros();
+    // The prompt, all but its last token, through the model together.
+    generation.prefill(transformer);
     // When the first answer token arrived: the prompt's positions before it
     // and the answer's after it are timed separately, since a chat's
     // latency is the one and its speed the other.

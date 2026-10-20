@@ -105,17 +105,29 @@ pub(crate) fn for_rows(
     chunk: usize,
     row: impl Fn(usize) -> f32 + Sync,
 ) {
-    let len = out.len();
+    let rows = Shared::new(out);
+    for_chunks(workers, rows.len, chunk, |r| {
+        // SAFETY: each row index goes to exactly one worker.
+        unsafe { rows.slice(r, 1)[0] = row(r) };
+    });
+}
+
+/// Runs `f(i)` for every `i` in `0..len`, the indices dealt out to
+/// `workers` in turn, `chunk` at a time: the split [`for_rows`] uses, for
+/// work that writes more than one output per index.
+pub(crate) fn for_chunks(
+    workers: &dyn Workers,
+    len: usize,
+    chunk: usize,
+    f: impl Fn(usize) + Sync,
+) {
     let chunk = chunk.max(1);
     let n = workers.count().max(1);
-    let rows = Shared::new(out);
     workers.run(&|w| {
         let mut start = w * chunk;
         while start < len {
-            for r in start..(start + chunk).min(len) {
-                // SAFETY: chunk `c` goes to worker `c % n` alone, so each
-                // row is written by exactly one worker.
-                unsafe { rows.slice(r, 1)[0] = row(r) };
+            for i in start..(start + chunk).min(len) {
+                f(i);
             }
             start += n * chunk;
         }

@@ -225,3 +225,53 @@ fn four_workers_compute_the_same_bits_as_one() {
         assert!(one == four, "position {pos}: the logits differ");
     }
 }
+
+/// Feeding tokens together through `prefill` leaves the model in exactly
+/// the state feeding them one at a time does: the next token's logits are
+/// the same bits. Over 150 tokens, so the batches of 64 and their
+/// boundaries are covered, on one worker and on four.
+#[test]
+fn prefill_computes_the_same_bits_as_one_token_at_a_time() {
+    let Some(mut file) = load() else { return };
+    let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
+    let bpe = Bpe::from_gguf(&gguf).unwrap();
+    let mut tokens = bpe.encode(STORY_PROMPT);
+    tokens.extend(
+        include_str!("data/smollm2_story.engine.ids")
+            .lines()
+            .map(|l| l.parse::<u32>().unwrap()),
+    );
+    tokens.truncate(150);
+    let last = tokens.len() - 1;
+
+    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+    let mut one_by_one = Transformer::new(config, weights, tokens.len());
+    for (pos, &token) in tokens[..last].iter().enumerate() {
+        one_by_one.forward(token, pos);
+    }
+    let expected: Vec<u32> = one_by_one
+        .forward(tokens[last], last)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+
+    let threads = Threads(4);
+    for workers in [None, Some(&threads)] {
+        let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+        let mut batched = Transformer::new(config, weights, tokens.len());
+        if let Some(workers) = workers {
+            batched.set_workers(workers);
+        }
+        batched.prefill(&tokens[..last], 0);
+        let got: Vec<u32> = batched
+            .forward(tokens[last], last)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert!(
+            got == expected,
+            "the logits after prefill differ ({} workers)",
+            if workers.is_some() { 4 } else { 1 }
+        );
+    }
+}

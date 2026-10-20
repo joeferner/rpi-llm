@@ -100,6 +100,8 @@ fn main() {
     let mut piece = Vec::new();
     let mut stdout = std::io::stdout().lock();
     let started = Instant::now();
+    // The prompt, all but its last token, through the model together.
+    generation.prefill(&mut transformer);
     let mut first = None;
     while let Some(step) = generation.step(&mut transformer) {
         if !step.generated {

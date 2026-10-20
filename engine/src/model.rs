@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use crate::gguf::{Gguf, Repacked, Tensor, TensorType};
 use crate::llama2::{self, FormatError, HEADER_BYTES};
-use crate::parallel::{Serial, Shared, Workers, for_each, for_rows};
+use crate::parallel::{Serial, Shared, Workers, for_chunks, for_each, for_rows};
 use crate::quant::{self, BLOCK, Block, Quantized};
 
 /// A model's shape and the constants its arithmetic needs.
@@ -421,6 +421,8 @@ pub struct Transformer<'a> {
 struct MatMul<'a> {
     /// The input of a Q8_0 matrix multiply, quantized.
     scratch: Quantized,
+    /// The inputs of a batched Q8_0 matrix multiply, quantized.
+    batch: quant::Batch,
     /// Who computes the output rows.
     workers: &'a dyn Workers,
 }
@@ -448,6 +450,7 @@ impl<'a> Transformer<'a> {
             value_cache: vec![0.0; cache],
             mm: MatMul {
                 scratch: Quantized::default(),
+                batch: quant::Batch::default(),
                 workers: &Serial,
             },
             context,
@@ -593,6 +596,163 @@ impl<'a> Transformer<'a> {
         matmul(&mut self.logits, &self.x, &w.classifier, &mut self.mm);
         &self.logits
     }
+
+    /// The most tokens [`Self::prefill`] runs through the model together; a
+    /// longer run goes through in batches of this many.
+    pub const MAX_BATCH: usize = 64;
+
+    /// Runs `tokens` through the model at positions `pos..pos + len`,
+    /// together, filling the key/value cache with exactly what feeding them
+    /// one at a time through [`Self::forward`] would put there — the same
+    /// bits — and computing no logits.
+    ///
+    /// For a prompt: everything but its last token goes through here, and
+    /// the last through `forward`, whose logits choose the first answer
+    /// token. Together is faster because each weight is read from memory
+    /// once for the whole batch instead of once per token, which turns the
+    /// prompt from memory-bound into compute-bound work.
+    ///
+    /// # Panics
+    ///
+    /// If the run goes past [`Self::context`], or a token is outside the
+    /// vocabulary.
+    pub fn prefill(&mut self, tokens: &[u32], pos: usize) {
+        for (i, batch) in tokens.chunks(Self::MAX_BATCH).enumerate() {
+            self.forward_batch(batch, pos + i * Self::MAX_BATCH);
+        }
+    }
+
+    /// [`Self::prefill`] for one batch of at most [`Self::MAX_BATCH`].
+    ///
+    /// The single-token [`Self::forward`] with every per-token buffer
+    /// widened to the batch: per-token steps (RMSNorm, RoPE, the residual
+    /// adds, SwiGLU) loop over the tokens doing exactly what `forward` does
+    /// for one, matrix multiplies take every token's row at once
+    /// ([`matmul_batch`]), and attention runs each (token, head) pair as a
+    /// job of its own, each token attending over the positions up to its
+    /// own.
+    fn forward_batch(&mut self, tokens: &[u32], pos0: usize) {
+        let c = self.config;
+        let w = &self.weights;
+        let n = tokens.len();
+        let (dim, hidden, ctx) = (c.dim, c.hidden_dim, self.context);
+        let head_size = c.head_size();
+        let kv_dim = c.kv_dim();
+        let kv_mul = c.n_heads / c.n_kv_heads;
+        assert!(pos0 + n <= ctx, "positions past the context");
+
+        let mut x = vec![0.0f32; n * dim];
+        let mut xb = vec![0.0f32; n * dim];
+        let mut xb2 = vec![0.0f32; n * dim];
+        let mut q = vec![0.0f32; n * dim];
+        let mut hb = vec![0.0f32; n * hidden];
+        let mut hb2 = vec![0.0f32; n * hidden];
+        let mut att = vec![0.0f32; n * c.n_heads * ctx];
+
+        for (t, &token) in tokens.iter().enumerate() {
+            w.token_embedding
+                .row_into(token as usize, &mut x[t * dim..(t + 1) * dim]);
+        }
+
+        for (l, layer) in w.layers.iter().enumerate() {
+            for t in 0..n {
+                let row = t * dim..(t + 1) * dim;
+                rmsnorm(&mut xb[row.clone()], &x[row], layer.rms_att, c.norm_eps);
+            }
+
+            // The batch's keys and values go straight into the cache: its
+            // positions are consecutive, so their rows are too.
+            let base = l * ctx * kv_dim;
+            let at = base + pos0 * kv_dim;
+            matmul_batch(&mut q, &xb, &layer.wq, &mut self.mm);
+            matmul_batch(
+                &mut self.key_cache[at..at + n * kv_dim],
+                &xb,
+                &layer.wk,
+                &mut self.mm,
+            );
+            matmul_batch(
+                &mut self.value_cache[at..at + n * kv_dim],
+                &xb,
+                &layer.wv,
+                &mut self.mm,
+            );
+
+            // RoPE, token by token, each at its own position.
+            for t in 0..n {
+                let pos = pos0 + t;
+                let k = &mut self.key_cache[at + t * kv_dim..at + (t + 1) * kv_dim];
+                let qt = &mut q[t * dim..(t + 1) * dim];
+                for i in (0..dim).step_by(2) {
+                    let head_dim = i % head_size;
+                    let freq = 1.0 / libm::powf(c.rope_theta, head_dim as f32 / head_size as f32);
+                    let val = pos as f32 * freq;
+                    let (fcr, fci) = (libm::cosf(val), libm::sinf(val));
+                    rotate(&mut qt[i..i + 2], fcr, fci);
+                    if i < kv_dim {
+                        rotate(&mut k[i..i + 2], fcr, fci);
+                    }
+                }
+            }
+
+            // Attention: every (token, head) pair a job of its own, each
+            // the same arithmetic `forward` does for that head at that
+            // token's position.
+            let scale = libm::sqrtf(head_size as f32);
+            let scores = Shared::new(&mut att);
+            let outputs = Shared::new(&mut xb);
+            let (queries, keys, values) = (&q, &self.key_cache, &self.value_cache);
+            for_each(self.mm.workers, n * c.n_heads, |i| {
+                let (t, h) = (i / c.n_heads, i % c.n_heads);
+                let pos = pos0 + t;
+                let qh = &queries[t * dim + h * head_size..t * dim + (h + 1) * head_size];
+                // SAFETY: pair `i`'s scores and its slice of `xb` are its
+                // own, and each pair runs on one worker.
+                let (att, out) = unsafe {
+                    (
+                        scores.slice(i * ctx, pos + 1),
+                        outputs.slice(t * dim + h * head_size, head_size),
+                    )
+                };
+                let kv_head = (h / kv_mul) * head_size;
+                for (s, score) in att.iter_mut().enumerate() {
+                    let at = base + s * kv_dim + kv_head;
+                    *score = dot(qh, &keys[at..at + head_size]) / scale;
+                }
+                softmax(att);
+
+                out.fill(0.0);
+                for (s, &a) in att.iter().enumerate() {
+                    let at = base + s * kv_dim + kv_head;
+                    for (o, &v) in out.iter_mut().zip(&values[at..at + head_size]) {
+                        *o += a * v;
+                    }
+                }
+            });
+
+            matmul_batch(&mut xb2, &xb, &layer.wo, &mut self.mm);
+            for (x, &d) in x.iter_mut().zip(&xb2) {
+                *x += d;
+            }
+
+            for t in 0..n {
+                let row = t * dim..(t + 1) * dim;
+                rmsnorm(&mut xb[row.clone()], &x[row], layer.rms_ffn, c.norm_eps);
+            }
+            matmul_batch(&mut hb, &xb, &layer.w1, &mut self.mm);
+            matmul_batch(&mut hb2, &xb, &layer.w3, &mut self.mm);
+            for (h, &g) in hb.iter_mut().zip(&hb2) {
+                let mut val = *h;
+                val *= 1.0 / (1.0 + libm::expf(-val));
+                val *= g;
+                *h = val;
+            }
+            matmul_batch(&mut xb, &hb, &layer.w2, &mut self.mm);
+            for (x, &d) in x.iter_mut().zip(&xb) {
+                *x += d;
+            }
+        }
+    }
 }
 
 /// `out = weight * x / rms(x)`, `run.c`'s `rmsnorm`.
@@ -654,6 +814,52 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
             for_rows(mm.workers, out, chunk, |i| {
                 let row = i * per_row..(i + 1) * per_row;
                 quant::dot(&values[row.clone()], &scales[row], scratch)
+            });
+        }
+    }
+}
+
+/// [`matmul`] for a batch: `xs` holds one input vector per token, and
+/// `out` gets token `t`'s output for row `r` at `t * rows + r`.
+///
+/// The rows are dealt out to the workers as in [`matmul`], and each worker
+/// computes all of a row's tokens while the row is in hand — for Q8_0 with
+/// [`quant::dot_batch`], whose results are the same bits [`quant::dot`]
+/// gives one token at a time.
+fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
+    let cols = w.cols();
+    let n = xs.len() / cols;
+    let rows = out.len() / n;
+    let outputs = Shared::new(out);
+    match *w {
+        Matrix::F32 { data, cols } => {
+            for_chunks(mm.workers, rows, CHUNK_BYTES / (cols * 4), |r| {
+                let row = &data[r * cols..(r + 1) * cols];
+                for t in 0..n {
+                    // SAFETY: row `r` goes to exactly one worker, and
+                    // `t * rows + r` is that row's output for token `t`.
+                    unsafe {
+                        outputs.slice(t * rows + r, 1)[0] = dot(row, &xs[t * cols..(t + 1) * cols])
+                    };
+                }
+            });
+        }
+        Matrix::Q8_0 {
+            values,
+            scales,
+            cols,
+        } => {
+            quant::quantize_batch(xs, cols, &mut mm.batch);
+            let per_row = cols / BLOCK;
+            let batch = &mm.batch;
+            for_chunks(mm.workers, rows, CHUNK_BYTES / cols, |r| {
+                let row = r * per_row..(r + 1) * per_row;
+                let mut sums = [0.0f32; Transformer::MAX_BATCH];
+                quant::dot_batch(&values[row.clone()], &scales[row], batch, &mut sums);
+                for (t, &sum) in sums.iter().enumerate().take(n) {
+                    // SAFETY: as above.
+                    unsafe { outputs.slice(t * rows + r, 1)[0] = sum };
+                }
             });
         }
     }

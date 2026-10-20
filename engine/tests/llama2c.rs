@@ -71,3 +71,45 @@ fn greedy_generation_matches_llama2_c() {
         expected_text.strip_suffix('\n').unwrap()
     );
 }
+
+/// `prefill` on the f32 path leaves the same bits as feeding one token at
+/// a time: llama2.c's own story, 150 tokens in, so batches of 64 and their
+/// boundaries are covered.
+#[test]
+fn prefill_computes_the_same_bits_as_one_token_at_a_time() {
+    let Some(model) = read_model_file("stories15M.bin") else {
+        eprintln!("skipped: no stories15M.bin in models/ (`make models`)");
+        return;
+    };
+    let checkpoint = model.bytes();
+    let header = Config::parse(checkpoint).unwrap();
+    let mut tokens = vec![BOS];
+    tokens.extend(
+        include_str!("data/once_upon_a_time.ids")
+            .lines()
+            .map(|l| l.parse::<u32>().unwrap())
+            .take(149),
+    );
+    let last = tokens.len() - 1;
+
+    let (config, weights) = Weights::from_llama2(&header, checkpoint).unwrap();
+    let mut one_by_one = Transformer::new(config, weights, 256);
+    for (pos, &token) in tokens[..last].iter().enumerate() {
+        one_by_one.forward(token, pos);
+    }
+    let expected: Vec<u32> = one_by_one
+        .forward(tokens[last], last)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+
+    let (config, weights) = Weights::from_llama2(&header, checkpoint).unwrap();
+    let mut batched = Transformer::new(config, weights, 256);
+    batched.prefill(&tokens[..last], 0);
+    let got: Vec<u32> = batched
+        .forward(tokens[last], last)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    assert!(got == expected, "the logits after prefill differ");
+}

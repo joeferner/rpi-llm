@@ -60,6 +60,27 @@ impl Generation {
         self.prompt.len()
     }
 
+    /// Runs every prompt token but the last through the model together
+    /// ([`Transformer::prefill`]), instead of one [`Self::step`] each.
+    ///
+    /// The cache ends up holding the same bits either way, so the answer is
+    /// the same; it just arrives sooner. The prompt tokens fed this way are
+    /// not returned as steps: the next `step` feeds the last prompt token
+    /// and returns the first answer token.
+    ///
+    /// # Panics
+    ///
+    /// If called after the first `step`.
+    pub fn prefill(&mut self, transformer: &mut Transformer) {
+        assert_eq!(self.pos, 0, "prefill comes before the first step");
+        let last = self.prompt.len() - 1;
+        if last > 0 {
+            transformer.prefill(&self.prompt[..last], 0);
+        }
+        self.pos = last;
+        self.token = self.prompt[last];
+    }
+
     /// Runs one position: `None` once `steps` positions have run or the
     /// model has chosen a stop token.
     pub fn step(&mut self, transformer: &mut Transformer) -> Option<Step> {

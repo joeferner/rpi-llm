@@ -241,7 +241,7 @@ fn dot_scalar(values: &[Block], scales: &[u16], x: &Quantized) -> f32 {
 mod neon {
     use core::arch::aarch64::*;
 
-    use super::{Block, Quantized};
+    use super::{Batch, Block, Quantized};
 
     /// Loads one aligned half of a block.
     ///
@@ -321,6 +321,152 @@ mod neon {
             }
         }
         sum
+    }
+
+    /// The most blocks a row may have for [`dot_batch`]'s widened scales:
+    /// 512 blocks is a 16384-wide row.
+    const MAX_BLOCKS: usize = 512;
+
+    /// [`super::dot_batch`] with `sdot`, four tokens at a time.
+    ///
+    /// For each block, the weight block is loaded once and meets four
+    /// tokens' blocks: eight `sdot`s, one reduction of the four tokens'
+    /// sums into one vector, one scaling, and one vector add into the four
+    /// tokens' running totals. Lane by lane that is exactly the sequence of
+    /// operations [`dot`] performs for one token, in the same block order,
+    /// so each token's result is the same bits; and the four lanes' adds no
+    /// longer wait on each other, which is where the single-token path
+    /// spends its time.
+    #[target_feature(enable = "dotprod")]
+    pub(super) unsafe fn dot_batch(values: &[Block], scales: &[u16], x: &Batch, out: &mut [f32]) {
+        let n = values.len();
+        assert!(n <= MAX_BLOCKS, "a row of more than {MAX_BLOCKS} blocks");
+        // The row's scales, widened once for every token group.
+        let mut dws = [0.0f32; MAX_BLOCKS];
+        for (dw, &h) in dws.iter_mut().zip(scales) {
+            *dw = super::f16_to_f32(h);
+        }
+        let tokens = x.tokens;
+        unsafe {
+            for g in 0..tokens / 4 {
+                let mut acc = vdupq_n_f32(0.0);
+                for b in 0..n {
+                    let w = &values[b];
+                    let (wl, wh) = (half(w, false), half(w, true));
+                    let at = b * tokens + 4 * g;
+                    let xs = &x.values[at..at + 4];
+                    let mut s = [vdupq_n_s32(0); 4];
+                    for (s, xb) in s.iter_mut().zip(xs) {
+                        *s = vdotq_s32(vdotq_s32(*s, wl, half(xb, false)), wh, half(xb, true));
+                    }
+                    let sums = vpaddq_s32(vpaddq_s32(s[0], s[1]), vpaddq_s32(s[2], s[3]));
+                    // `at` is a multiple of four, so this is one aligned
+                    // group of the four tokens' scales for block `b`.
+                    let dx: float32x4_t = *(&x.scales[at / 4] as *const super::Scales).cast();
+                    let p = vmulq_f32(vcvtq_f32_s32(sums), vmulq_f32(vdupq_n_f32(dws[b]), dx));
+                    acc = vaddq_f32(acc, p);
+                }
+                vst1q_f32(out[4 * g..4 * g + 4].as_mut_ptr(), acc);
+            }
+        }
+    }
+}
+
+/// Tokens a batch is processed in groups of: one vector's lanes.
+pub const LANES: usize = 4;
+
+/// Several vectors quantized to Q8_0 together: a batch of tokens' inputs to
+/// one matrix multiply, laid out block-major so that one weight block meets
+/// every token's matching block in neighbouring memory.
+///
+/// The token count is rounded up to [`LANES`]; the padding tokens are
+/// zeros, and their results are thrown away.
+#[derive(Default)]
+pub struct Batch {
+    /// Tokens, padding included: a multiple of [`LANES`].
+    tokens: usize,
+    /// Token `t`'s block `b` is at `b * tokens + t`.
+    values: Vec<Block>,
+    /// Its scale is lane `t % 4` of group `(b * tokens + t) / 4`.
+    scales: Vec<Scales>,
+    /// One token's quantization, before it is spread into the batch.
+    one: Quantized,
+}
+
+impl Batch {
+    /// Tokens in the batch, padding included.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+}
+
+/// Quantizes `xs`, consecutive vectors of `n` values each, into `out`.
+///
+/// Each vector is quantized exactly as [`quantize`] does it, so its blocks
+/// and scales are the ones a single-token matrix multiply would use.
+///
+/// # Panics
+///
+/// If `n` is not a multiple of [`BLOCK`] or `xs` not a whole number of
+/// vectors.
+pub fn quantize_batch(xs: &[f32], n: usize, out: &mut Batch) {
+    assert!(xs.len().is_multiple_of(n), "whole vectors");
+    let real = xs.len() / n;
+    let tokens = real.next_multiple_of(LANES);
+    let blocks = n / BLOCK;
+    out.tokens = tokens;
+    out.values.clear();
+    out.values.resize(blocks * tokens, Block([0; BLOCK]));
+    out.scales.clear();
+    out.scales.resize(blocks * tokens / 4, Scales::default());
+    for (t, x) in xs.chunks_exact(n).enumerate() {
+        quantize(x, &mut out.one);
+        for b in 0..blocks {
+            let at = b * tokens + t;
+            out.values[at] = out.one.values[b];
+            out.scales[at / 4].0[at % 4] = out.one.scale(b);
+        }
+    }
+}
+
+/// The dot products of one repacked Q8_0 row with every vector in `x`, into
+/// `out` (one per token, padding included).
+///
+/// Each token's result is the same bits [`dot`] gives for that token alone:
+/// the same per-block products, added in the same order. Only which
+/// tokens' sums travel together in a vector differs.
+///
+/// # Panics
+///
+/// If `out` is shorter than `x.tokens()`.
+pub fn dot_batch(values: &[Block], scales: &[u16], x: &Batch, out: &mut [f32]) {
+    assert!(out.len() >= x.tokens, "a result for every token");
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: as in `dot`.
+        unsafe { neon::dot_batch(values, scales, x, out) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_batch_scalar(values, scales, x, out)
+    }
+}
+
+/// [`dot_batch`], one token and one multiply at a time.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn dot_batch_scalar(values: &[Block], scales: &[u16], x: &Batch, out: &mut [f32]) {
+    let tokens = x.tokens;
+    for (t, o) in out.iter_mut().enumerate().take(tokens) {
+        let mut sum = 0.0f32;
+        for (b, (w, &dw)) in values.iter().zip(scales).enumerate() {
+            let at = b * tokens + t;
+            let mut sumi = 0i32;
+            for (&a, &v) in w.0.iter().zip(&x.values[at].0) {
+                sumi += i32::from(a) * i32::from(v);
+            }
+            sum += sumi as f32 * (f16_to_f32(dw) * x.scales[at / 4].0[at % 4]);
+        }
+        *o = sum;
     }
 }
 
