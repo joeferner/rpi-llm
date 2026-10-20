@@ -116,10 +116,11 @@ A serial terminal over the RP1 UART0 (GPIO14/15):
    matrix together, so one pass over the weights serves many tokens. That
    makes the prompt compute-bound instead of memory-bound, where four
    cores can scale. Matrix multiplies and attention already run on all
-   four cores, but generation is memory-bound: 20.8 tok/s against 19.4 on
-   one core, the matrix multiplies reading about 9.5 GB/s of the
-   11.6 GB/s `make bandwidth` measured for four cores together (one core
-   alone reads 14.0). The prompt, at 22.8 tok/s, gained nothing.
+   four cores, and generation is memory-bound: 25.5 tok/s (19.4 on one
+   core), the matrix multiplies reading about 11 GB/s of the 13.9 GB/s
+   four cores reach when they interleave their reads 4 KiB at a time
+   (`make bandwidth`; contiguous quarters reach only 11.5). The prompt
+   runs at 28.5 tok/s, barely faster than generation.
 2. Fan control, then the side-by-side benchmark against llama.cpp on
    Raspberry Pi OS.
 

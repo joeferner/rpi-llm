@@ -622,8 +622,12 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
-/// `out = w @ x`, one output per row of `w`, the rows split across the
-/// workers.
+/// How many bytes of weights each worker takes at a time when a matrix's
+/// rows are dealt out: see [`for_rows`] for why it is a few KiB.
+const CHUNK_BYTES: usize = 4096;
+
+/// `out = w @ x`, one output per row of `w`, the rows dealt out across the
+/// workers about [`CHUNK_BYTES`] of weights at a time.
 ///
 /// Where nearly all the time goes. An F32 matrix is the plain loop llama2.c
 /// has; a Q8_0 matrix quantizes `x` once, as ggml does, and every worker
@@ -631,7 +635,10 @@ fn softmax(x: &mut [f32]) {
 fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
     match *w {
         Matrix::F32 { data, cols } => {
-            for_rows(mm.workers, out, |i| dot(&data[i * cols..(i + 1) * cols], x));
+            let chunk = CHUNK_BYTES / (cols * 4);
+            for_rows(mm.workers, out, chunk, |i| {
+                dot(&data[i * cols..(i + 1) * cols], x)
+            });
         }
         Matrix::Q8_0 {
             values,
@@ -641,7 +648,10 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
             quant::quantize(x, &mut mm.scratch);
             let per_row = cols / BLOCK;
             let scratch = &mm.scratch;
-            for_rows(mm.workers, out, |i| {
+            // A row's values are a byte each; its scales are a sixteenth
+            // as much again, in a separate array.
+            let chunk = CHUNK_BYTES / cols;
+            for_rows(mm.workers, out, chunk, |i| {
                 let row = i * per_row..(i + 1) * per_row;
                 quant::dot(&values[row.clone()], &scales[row], scratch)
             });

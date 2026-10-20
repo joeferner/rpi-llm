@@ -88,12 +88,36 @@ pub(crate) fn for_each(workers: &dyn Workers, n: usize, f: impl Fn(usize) + Sync
     });
 }
 
-/// Sets `out[r] = row(r)` for every row, the rows split into contiguous
-/// ranges across `workers`.
-pub(crate) fn for_rows(workers: &dyn Workers, out: &mut [f32], row: impl Fn(usize) -> f32 + Sync) {
+/// Sets `out[r] = row(r)` for every row, the rows dealt out to `workers`
+/// in turn, `chunk` at a time: worker `w` takes chunks `w`, `w + n`,
+/// `w + 2n`...
+///
+/// Interleaved rather than contiguous because of what the Pi 5's memory
+/// does with four readers. Four cores each streaming their own quarter of
+/// a matrix read 11.5 GB/s between them; taking turns through it a few
+/// KiB at a time, so that at any moment they are reading neighbouring
+/// addresses, they read 13.9 — as fast as one core alone (rpi-llm's
+/// `examples/bandwidth.rs`). A matrix multiply sizes `chunk` to about
+/// 4 KiB of its weights.
+pub(crate) fn for_rows(
+    workers: &dyn Workers,
+    out: &mut [f32],
+    chunk: usize,
+    row: impl Fn(usize) -> f32 + Sync,
+) {
+    let len = out.len();
+    let chunk = chunk.max(1);
+    let n = workers.count().max(1);
     let rows = Shared::new(out);
-    for_each(workers, rows.len, |r| {
-        // SAFETY: each row index goes to exactly one worker.
-        unsafe { rows.slice(r, 1)[0] = row(r) };
+    workers.run(&|w| {
+        let mut start = w * chunk;
+        while start < len {
+            for r in start..(start + chunk).min(len) {
+                // SAFETY: chunk `c` goes to worker `c % n` alone, so each
+                // row is written by exactly one worker.
+                unsafe { rows.slice(r, 1)[0] = row(r) };
+            }
+            start += n * chunk;
+        }
     });
 }
