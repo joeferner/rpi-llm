@@ -46,17 +46,23 @@ const PASSES: usize = 3;
 #[repr(C, align(64))]
 struct Line([u64; 8]);
 
-/// What one worker is asked to sum: a run of lines.
+/// What one worker is asked to sum: `count` chunks of `chunk` lines, the
+/// first at line `start` and each `step` lines after the last. A
+/// contiguous part is one chunk; an interleaved split is many.
 struct Job {
     start: AtomicUsize,
-    len: AtomicUsize,
+    chunk: AtomicUsize,
+    step: AtomicUsize,
+    count: AtomicUsize,
 }
 
 /// Each core's job, each in its own cache line.
 static JOBS: [CacheAligned<Job>; 4] = [const {
     CacheAligned(Job {
         start: AtomicUsize::new(0),
-        len: AtomicUsize::new(0),
+        chunk: AtomicUsize::new(0),
+        step: AtomicUsize::new(0),
+        count: AtomicUsize::new(0),
     })
 }; 4];
 
@@ -101,18 +107,67 @@ fn sum(lines: &[Line]) -> u64 {
     }
 }
 
-/// The lines of the job core `core` was given.
-fn job_lines(core: usize) -> &'static [Line] {
+/// Sums the job core `core` was given.
+fn run_job(core: usize) -> u64 {
     let job = &JOBS[core].0;
     let base = BASE.load(Ordering::Acquire) as *const Line;
-    // SAFETY: core 0 set `BASE` to the buffer, which lives until the
-    // program ends, and every job is a run of lines inside it.
-    unsafe {
-        core::slice::from_raw_parts(
-            base.add(job.start.load(Ordering::Acquire)),
-            job.len.load(Ordering::Acquire),
-        )
+    let (start, chunk, step, count) = (
+        job.start.load(Ordering::Acquire),
+        job.chunk.load(Ordering::Acquire),
+        job.step.load(Ordering::Acquire),
+        job.count.load(Ordering::Acquire),
+    );
+    let mut total = 0u64;
+    for k in 0..count {
+        // SAFETY: core 0 set `BASE` to the buffer, which lives until the
+        // program ends, and every chunk of every job is inside it.
+        let lines = unsafe { core::slice::from_raw_parts(base.add(start + k * step), chunk) };
+        total = total.wrapping_add(sum(lines));
     }
+    total
+}
+
+/// Times reading the buffer on `n` cores, each taking every `n`th chunk of
+/// `chunk` lines (one chunk each when `chunk` is a whole part), best of
+/// [`PASSES`]. Returns the bytes read and the microseconds it took.
+fn measure(n: usize, chunk: usize, lines: usize, timer: &Timer) -> (u64, u64) {
+    let count = lines / (n * chunk);
+    for (core, job) in JOBS.iter().enumerate() {
+        let job = &job.0;
+        job.start.store(core * chunk, Ordering::Relaxed);
+        job.chunk.store(chunk, Ordering::Relaxed);
+        job.step.store(n * chunk, Ordering::Relaxed);
+        // Workers outside this pass get an empty job.
+        job.count
+            .store(if core < n { count } else { 0 }, Ordering::Relaxed);
+    }
+
+    let mut best = u64::MAX;
+    for _ in 0..PASSES {
+        DONE.0.store(0, Ordering::Relaxed);
+        let started = timer.now_micros();
+        GO.0.fetch_add(1, Ordering::Release);
+        signal_event();
+        SINK.0.fetch_add(run_job(0), Ordering::Relaxed);
+        while DONE.0.load(Ordering::Acquire) < 3 {
+            core::hint::spin_loop();
+        }
+        best = best.min(timer.now_micros() - started);
+    }
+    ((count * chunk * n * 64) as u64, best)
+}
+
+/// Prints one measurement as GB/s (10^9 bytes).
+fn report(uart: &mut Uart, label: core::fmt::Arguments, (bytes, us): (u64, u64)) {
+    // Bytes per microsecond is MB/s; in tenths of a GB/s.
+    let tenths = bytes * 10 / us / 1000;
+    let _ = writeln!(
+        uart,
+        "{label}: {} MiB in {us} us, {}.{} GB/s\r",
+        bytes / (1024 * 1024),
+        tenths / 10,
+        tenths % 10,
+    );
 }
 
 /// Cores 1-3: wait for a pass, sum the job, report done, repeat.
@@ -128,8 +183,7 @@ extern "C" fn worker() -> ! {
             wait_for_event();
         };
         seen = go;
-        let total = sum(job_lines(id));
-        SINK.0.fetch_add(total, Ordering::Relaxed);
+        SINK.0.fetch_add(run_job(id), Ordering::Relaxed);
         DONE.0.fetch_add(1, Ordering::Release);
     }
 }
@@ -175,43 +229,23 @@ pub extern "C" fn kmain() -> ! {
         cores.core3.spawn(s3, worker);
     }
 
+    // Contiguous parts: each core streams its own quarter (or half...).
     for n in 1..=4usize {
-        let part = lines / n;
-        for (core, job) in JOBS.iter().enumerate().take(n) {
-            job.0.start.store(core * part, Ordering::Relaxed);
-            job.0.len.store(part, Ordering::Relaxed);
-        }
-        // Workers outside this pass get an empty job.
-        for job in &JOBS[n..] {
-            job.0.len.store(0, Ordering::Relaxed);
-        }
+        let result = measure(n, lines / n, lines, &timer);
+        report(&mut uart, format_args!("contiguous, {n} core(s)"), result);
+    }
 
-        let mut best = u64::MAX;
-        for _ in 0..PASSES {
-            DONE.0.store(0, Ordering::Relaxed);
-            let started = timer.now_micros();
-            GO.0.fetch_add(1, Ordering::Release);
-            signal_event();
-            let total = sum(job_lines(0));
-            SINK.0.fetch_add(total, Ordering::Relaxed);
-            while DONE.0.load(Ordering::Acquire) < 3 {
-                core::hint::spin_loop();
-            }
-            best = best.min(timer.now_micros() - started);
+    // Interleaved: the cores take turns through the buffer a chunk at a
+    // time, so at any moment they read nearby addresses.
+    for n in [2usize, 4] {
+        for chunk_bytes in [64usize, 1024, 4096, 64 * 1024, 1024 * 1024] {
+            let result = measure(n, chunk_bytes / 64, lines, &timer);
+            report(
+                &mut uart,
+                format_args!("interleaved {chunk_bytes} B chunks, {n} cores"),
+                result,
+            );
         }
-
-        let bytes = (part * n * 64) as u64;
-        // Tenths of a GB/s (10^9 bytes): bytes per microsecond is MB/s.
-        let tenths = bytes * 10 / best / 1000;
-        let _ = writeln!(
-            uart,
-            "{n} core{}: {} MiB in {} us, {}.{} GB/s\r",
-            if n == 1 { " " } else { "s" },
-            bytes / (1024 * 1024),
-            best,
-            tenths / 10,
-            tenths % 10,
-        );
     }
 
     let _ = writeln!(
