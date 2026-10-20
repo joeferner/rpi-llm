@@ -1,0 +1,17 @@
+[package]
+name = "rpi-llm-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "rpi-llm's engine as a Linux program, for benchmarking it against llama.cpp on the same board"
+
+# A workspace of its own, so building it on a Pi running Linux needs only
+# this repository: the main workspace's bare-metal program patches rpi-hal
+# from a sibling checkout this program has no use for.
+[workspace]
+
+[dependencies]
+rpi-llm-engine = { path = "../engine" }
+
+[profile.release]
+debug = false

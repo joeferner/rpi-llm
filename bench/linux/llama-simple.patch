@@ -1,0 +1,68 @@
+diff --git a/examples/simple/simple.cpp b/examples/simple/simple.cpp
+index ebb1969..dc657ac 100644
+--- a/examples/simple/simple.cpp
++++ b/examples/simple/simple.cpp
+@@ -94,8 +94,14 @@ int main(int argc, char ** argv) {
+ 
+     llama_model_params model_params = llama_model_default_params();
+     model_params.n_gpu_layers = ngl;
++    // rpi-llm benchmark: read the whole model into RAM, so the load is a
++    // real read of the file rather than an mmap that faults pages in
++    // during the first tokens, and time it.
++    model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+ 
++    const auto t_load_start = ggml_time_us();
+     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
++    const auto t_load_end = ggml_time_us();
+ 
+     if (model == NULL) {
+         fprintf(stderr , "%s: error: unable to load model\n" , __func__);
+@@ -124,6 +130,14 @@ int main(int argc, char ** argv) {
+     ctx_params.n_batch = n_prompt;
+     // enable performance counters
+     ctx_params.no_perf = false;
++    // rpi-llm benchmark: the thread count from the environment.
++    if (const char * threads = getenv("RPI_LLM_THREADS")) {
++        ctx_params.n_threads = atoi(threads);
++        ctx_params.n_threads_batch = atoi(threads);
++    }
++    for (auto id : prompt_tokens) {
++        fprintf(stderr, "P %d\n", id);
++    }
+ 
+     llama_context * ctx = llama_init_from_model(model, ctx_params);
+ 
+@@ -178,6 +192,9 @@ int main(int argc, char ** argv) {
+     // main loop
+ 
+     const auto t_main_start = ggml_time_us();
++    // rpi-llm benchmark: when the first answer token was chosen, which
++    // ends the prompt's time and starts the answer's.
++    int64_t t_first = 0;
+     int n_decode = 0;
+     llama_token new_token_id;
+ 
+@@ -193,6 +210,10 @@ int main(int argc, char ** argv) {
+         // sample the next token
+         {
+             new_token_id = llama_sampler_sample(smpl, ctx, -1);
++            if (t_first == 0) {
++                t_first = ggml_time_us();
++            }
++            fprintf(stderr, "G %d\n", new_token_id);
+ 
+             // is it an end of generation?
+             if (llama_vocab_is_eog(vocab, new_token_id)) {
+@@ -221,6 +242,12 @@ int main(int argc, char ** argv) {
+ 
+     const auto t_main_end = ggml_time_us();
+ 
++    // rpi-llm benchmark: one machine-readable line, timed the way
++    // rpi-llm's own programs time themselves.
++    fprintf(stderr, "BENCH load_us=%lld prompt_tokens=%d prompt_us=%lld answer_tokens=%d answer_us=%lld\n",
++            (long long) (t_load_end - t_load_start), n_prompt, (long long) (t_first - t_main_start),
++            n_decode, (long long) (t_main_end - t_first));
++
+     fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
+             __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
+ 
