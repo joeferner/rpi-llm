@@ -19,7 +19,21 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rpi_hal::cpu::core_id;
 use rpi_hal::multicore::{CacheAligned, Cores, Stack, signal_event, wait_for_event};
+use rpi_llm_engine::model::Clock;
 use rpi_llm_engine::parallel::Workers;
+
+/// The generic counter as the engine's [`Clock`], for timing its phases.
+pub struct Counter;
+
+impl Clock for Counter {
+    fn ticks(&self) -> u64 {
+        ticks()
+    }
+
+    fn ticks_per_second(&self) -> u64 {
+        tick_rate()
+    }
+}
 
 /// The job being run, as a pointer whose lifetime has been erased.
 ///

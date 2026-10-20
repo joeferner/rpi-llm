@@ -419,14 +419,79 @@ pub struct Transformer<'a> {
     mm: MatMul<'a>,
 }
 
+/// A source of time for [`Transformer::set_clock`]: the engine has no
+/// hardware of its own, so whoever runs it supplies one.
+pub trait Clock: Sync {
+    /// A free-running count, in [`Self::ticks_per_second`] units.
+    fn ticks(&self) -> u64;
+    /// How fast [`Self::ticks`] counts.
+    fn ticks_per_second(&self) -> u64;
+}
+
+/// Where a run of [`Transformer::forward`] or [`Transformer::prefill`]
+/// calls spent its time, in clock ticks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Phases {
+    /// Calls: tokens for `forward`, batches for `prefill`.
+    pub calls: u64,
+    /// Everything, start to end of each call.
+    pub total: u64,
+    /// Quantizing matrix multiplies' inputs.
+    pub quantize: u64,
+    /// The matrix multiplies themselves, on all the workers.
+    pub matmul: u64,
+    /// Attention, on all the workers.
+    pub attention: u64,
+}
+
+impl Phases {
+    /// What `total` holds besides the phases named: the per-token steps
+    /// (RMSNorm, RoPE, SwiGLU, the residual adds) and buffer setup.
+    pub fn other(&self) -> u64 {
+        self.total
+            .saturating_sub(self.quantize + self.matmul + self.attention)
+    }
+}
+
+/// [`Phases`] for prompts and for single tokens, kept apart.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Profile {
+    /// [`Transformer::prefill`]'s batches.
+    pub prefill: Phases,
+    /// [`Transformer::forward`]'s tokens.
+    pub forward: Phases,
+}
+
 /// A matrix multiply's scratch space and the workers it is split across.
 struct MatMul<'a> {
     /// The input of a Q8_0 matrix multiply, quantized.
     scratch: Quantized,
     /// The inputs of a batched Q8_0 matrix multiply, quantized.
     batch: quant::Batch,
+    /// What times the phases, if anything does.
+    clock: Option<&'a dyn Clock>,
+    /// The phases' times so far.
+    profile: Profile,
+    /// Whether the time being spent is a prefill's.
+    in_prefill: bool,
     /// Who computes the output rows.
     workers: &'a dyn Workers,
+}
+
+impl MatMul<'_> {
+    /// The clock's time, or 0 with no clock.
+    fn now(&self) -> u64 {
+        self.clock.map_or(0, |c| c.ticks())
+    }
+
+    /// The phases the time being spent belongs to.
+    fn phases(&mut self) -> &mut Phases {
+        if self.in_prefill {
+            &mut self.profile.prefill
+        } else {
+            &mut self.profile.forward
+        }
+    }
 }
 
 impl<'a> Transformer<'a> {
@@ -453,6 +518,9 @@ impl<'a> Transformer<'a> {
             mm: MatMul {
                 scratch: Quantized::default(),
                 batch: quant::Batch::default(),
+                clock: None,
+                profile: Profile::default(),
+                in_prefill: false,
                 workers: &Serial,
             },
             context,
@@ -478,6 +546,23 @@ impl<'a> Transformer<'a> {
         self.mm.workers = workers;
     }
 
+    /// Times every call's phases with `clock` from now on (see
+    /// [`Self::profile`]). Without a clock nothing is timed.
+    pub fn set_clock(&mut self, clock: &'a dyn Clock) {
+        self.mm.clock = Some(clock);
+    }
+
+    /// Where the calls since the last [`Self::reset_profile`] spent their
+    /// time, if a clock is set.
+    pub fn profile(&self) -> Profile {
+        self.mm.profile
+    }
+
+    /// Zeroes [`Self::profile`].
+    pub fn reset_profile(&mut self) {
+        self.mm.profile = Profile::default();
+    }
+
     /// Runs `token` through the model at position `pos` and returns the
     /// logits for the token after it.
     ///
@@ -497,6 +582,7 @@ impl<'a> Transformer<'a> {
         let kv_dim = c.kv_dim();
         let kv_mul = c.n_heads / c.n_kv_heads;
         assert!(pos < ctx, "position {pos} is past the context");
+        let started = self.mm.now();
 
         w.token_embedding.row_into(token as usize, &mut self.x);
 
@@ -539,6 +625,7 @@ impl<'a> Transformer<'a> {
             // the workers. Each head reads the shared query and cache and
             // writes only its own scores and its own slice of `xb`, and its
             // arithmetic is the same whichever worker runs it.
+            let attention_started = self.mm.now();
             let scale = libm::sqrtf(head_size as f32);
             let scores = Shared::new(&mut self.att);
             let outputs = Shared::new(&mut self.xb);
@@ -569,6 +656,8 @@ impl<'a> Transformer<'a> {
                     }
                 }
             });
+            let attention_ended = self.mm.now();
+            self.mm.phases().attention += attention_ended - attention_started;
 
             matmul(&mut self.xb2, &self.xb, &layer.wo, &mut self.mm);
             for (x, &d) in self.x.iter_mut().zip(&self.xb2) {
@@ -596,6 +685,11 @@ impl<'a> Transformer<'a> {
         self.xb.copy_from_slice(&self.x);
         rmsnorm(&mut self.x, &self.xb, w.rms_final, c.norm_eps);
         matmul(&mut self.logits, &self.x, &w.classifier, &mut self.mm);
+
+        let ended = self.mm.now();
+        let phases = self.mm.phases();
+        phases.total += ended - started;
+        phases.calls += 1;
         &self.logits
     }
 
@@ -642,6 +736,8 @@ impl<'a> Transformer<'a> {
         let kv_dim = c.kv_dim();
         let kv_mul = c.n_heads / c.n_kv_heads;
         assert!(pos0 + n <= ctx, "positions past the context");
+        self.mm.in_prefill = true;
+        let started = self.mm.now();
 
         let mut x = vec![0.0f32; n * dim];
         let mut xb = vec![0.0f32; n * dim];
@@ -700,6 +796,7 @@ impl<'a> Transformer<'a> {
             // Attention: every (token, head) pair a job of its own, each
             // the same arithmetic `forward` does for that head at that
             // token's position.
+            let attention_started = self.mm.now();
             let scale = libm::sqrtf(head_size as f32);
             let scores = Shared::new(&mut att);
             let outputs = Shared::new(&mut xb);
@@ -731,6 +828,8 @@ impl<'a> Transformer<'a> {
                     }
                 }
             });
+            let attention_ended = self.mm.now();
+            self.mm.phases().attention += attention_ended - attention_started;
 
             matmul_batch(&mut xb2, &xb, &layer.wo, &mut self.mm);
             for (x, &d) in x.iter_mut().zip(&xb2) {
@@ -754,6 +853,12 @@ impl<'a> Transformer<'a> {
                 *x += d;
             }
         }
+
+        let ended = self.mm.now();
+        let phases = self.mm.phases();
+        phases.total += ended - started;
+        phases.calls += 1;
+        self.mm.in_prefill = false;
     }
 }
 
@@ -795,6 +900,8 @@ const CHUNK_BYTES: usize = 4096;
 /// has; a Q8_0 matrix quantizes `x` once, as ggml does, and every worker
 /// takes its quads' dot products with [`quant::dot4`] against that.
 fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
+    let started = mm.now();
+    let mut quantizing = 0;
     match *w {
         Matrix::F32 { data, cols } => {
             let chunk = CHUNK_BYTES / (cols * 4);
@@ -808,6 +915,7 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
             cols,
         } => {
             quant::quantize(x, &mut mm.scratch);
+            quantizing = mm.now() - started;
             let per_row = cols / BLOCK;
             let scratch = &mm.scratch;
             let quads = out.len() / QUAD;
@@ -820,6 +928,18 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
                 unsafe { outputs.slice(QUAD * q, QUAD) }.copy_from_slice(&sums);
             });
         }
+    }
+    mm.book(started, quantizing);
+}
+
+impl MatMul<'_> {
+    /// Books a matrix multiply that began at `started` and spent
+    /// `quantizing` of its time quantizing its input.
+    fn book(&mut self, started: u64, quantizing: u64) {
+        let elapsed = self.now() - started;
+        let phases = self.phases();
+        phases.quantize += quantizing;
+        phases.matmul += elapsed - quantizing;
     }
 }
 
@@ -842,6 +962,8 @@ fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
     let n = xs.len() / cols;
     let rows = out.len() / n;
     let outputs = Shared::new(out);
+    let started = mm.now();
+    let mut quantizing = 0;
     match *w {
         Matrix::F32 { data, cols } => {
             for_chunks(mm.workers, rows, CHUNK_BYTES / (cols * 4), |r| {
@@ -861,6 +983,7 @@ fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
             cols,
         } => {
             quant::quantize_batch(xs, cols, &mut mm.batch);
+            quantizing = mm.now() - started;
             let per_row = cols / BLOCK;
             let batch = &mm.batch;
             for_chunks(mm.workers, rows / QUAD, quads_per_chunk(cols), |q| {
@@ -876,6 +999,7 @@ fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
             });
         }
     }
+    mm.book(started, quantizing);
 }
 
 /// A left-to-right dot product.

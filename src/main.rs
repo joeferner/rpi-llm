@@ -27,7 +27,7 @@ use rpi_kickstart::{console, heap, logln, storage};
 use rpi_llm_engine::bpe::Bpe;
 use rpi_llm_engine::generate::Generation;
 use rpi_llm_engine::gguf::Gguf;
-use rpi_llm_engine::model::{Transformer, Weights};
+use rpi_llm_engine::model::{Clock, Phases, Transformer, Weights};
 use static_cell::StaticCell;
 
 /// The model, on the card.
@@ -150,6 +150,7 @@ pub extern "C" fn kmain() -> ! {
     // SAFETY: the only call; nothing else here uses the secondary cores.
     let pool = unsafe { cores::Pool::start() };
     transformer.set_workers(pool);
+    transformer.set_clock(&cores::Counter);
     logln!("cores: matrix multiplies split across 4 cores");
 
     full_speed(&mut mailbox);
@@ -157,6 +158,10 @@ pub extern "C" fn kmain() -> ! {
     cores::reset_stats();
     let started = timer.now_micros();
     let ids = chat(&mut transformer, &bpe, &timer);
+    let profile = transformer.profile();
+    let rate = cores::Counter.ticks_per_second();
+    report_phases("prompt", &profile.prefill, rate);
+    report_phases("answer", &profile.forward, rate);
     let total_ms = (timer.now_micros() - started) / 1000;
     let (per_core, jobs) = cores::stats();
     logln!(
@@ -254,6 +259,22 @@ fn chat(transformer: &mut Transformer, bpe: &Bpe, timer: &Timer) -> Vec<u32> {
         }
     }
     ids
+}
+
+/// Logs where the engine's calls spent their time: `prompt` for the
+/// prefill batches, `answer` for the single-token forwards (which include
+/// the prompt's last token).
+fn report_phases(name: &str, p: &Phases, rate: u64) {
+    let ms = |ticks: u64| ticks as f32 * 1000.0 / rate as f32;
+    logln!(
+        "phases: {name}: {} calls in {:.1} ms: quantize {:.1}, matmul {:.1}, attention {:.1}, other {:.1}",
+        p.calls,
+        ms(p.total),
+        ms(p.quantize),
+        ms(p.matmul),
+        ms(p.attention),
+        ms(p.other()),
+    );
 }
 
 /// Logs whether `ids` is the answer the engine produced on the host.
