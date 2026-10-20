@@ -417,6 +417,8 @@ pub struct Transformer<'a> {
     value_cache: Vec<f32>,
     /// What every matrix multiply needs besides its operands.
     mm: MatMul<'a>,
+    /// [`Self::prefill`]'s buffers.
+    batch: BatchBuffers,
 }
 
 /// A source of time for [`Transformer::set_clock`]: the engine has no
@@ -515,6 +517,7 @@ impl<'a> Transformer<'a> {
             logits: vec![0.0; config.vocab_size],
             key_cache: vec![0.0; cache],
             value_cache: vec![0.0; cache],
+            batch: BatchBuffers::default(),
             mm: MatMul {
                 scratch: Quantized::default(),
                 batch: quant::Batch::default(),
@@ -585,6 +588,10 @@ impl<'a> Transformer<'a> {
         let started = self.mm.now();
 
         w.token_embedding.row_into(token as usize, &mut self.x);
+        // The RoPE angles depend on the position and the pair's place in
+        // its head, not the layer: computed once here, used by all of them.
+        let mut angles = [(0.0f32, 0.0f32); MAX_HEAD_SIZE / 2];
+        rope_angles(c.rope_theta, head_size, pos, &mut angles[..head_size / 2]);
 
         for (l, layer) in w.layers.iter().enumerate() {
             rmsnorm(&mut self.xb, &self.x, layer.rms_att, c.norm_eps);
@@ -592,18 +599,20 @@ impl<'a> Transformer<'a> {
             // This position's key and value go straight into the cache.
             let base = l * ctx * kv_dim;
             let at = base + pos * kv_dim;
-            matmul(&mut self.q, &self.xb, &layer.wq, &mut self.mm);
+            matmul(&mut self.q, &self.xb, &layer.wq, &mut self.mm, Input::New);
             matmul(
                 &mut self.key_cache[at..at + kv_dim],
                 &self.xb,
                 &layer.wk,
                 &mut self.mm,
+                Input::Same,
             );
             matmul(
                 &mut self.value_cache[at..at + kv_dim],
                 &self.xb,
                 &layer.wv,
                 &mut self.mm,
+                Input::Same,
             );
 
             // RoPE: rotate each adjacent pair of the query, and of the key
@@ -611,10 +620,7 @@ impl<'a> Transformer<'a> {
             // pair's place in its head.
             let k = &mut self.key_cache[at..at + kv_dim];
             for i in (0..dim).step_by(2) {
-                let head_dim = i % head_size;
-                let freq = 1.0 / libm::powf(c.rope_theta, head_dim as f32 / head_size as f32);
-                let val = pos as f32 * freq;
-                let (fcr, fci) = (libm::cosf(val), libm::sinf(val));
+                let (fcr, fci) = angles[(i % head_size) / 2];
                 rotate(&mut self.q[i..i + 2], fcr, fci);
                 if i < kv_dim {
                     rotate(&mut k[i..i + 2], fcr, fci);
@@ -659,22 +665,31 @@ impl<'a> Transformer<'a> {
             let attention_ended = self.mm.now();
             self.mm.phases().attention += attention_ended - attention_started;
 
-            matmul(&mut self.xb2, &self.xb, &layer.wo, &mut self.mm);
+            matmul(&mut self.xb2, &self.xb, &layer.wo, &mut self.mm, Input::New);
             for (x, &d) in self.x.iter_mut().zip(&self.xb2) {
                 *x += d;
             }
 
             // The feed-forward layer: w2(silu(w1(x)) * w3(x)).
             rmsnorm(&mut self.xb, &self.x, layer.rms_ffn, c.norm_eps);
-            matmul(&mut self.hb, &self.xb, &layer.w1, &mut self.mm);
-            matmul(&mut self.hb2, &self.xb, &layer.w3, &mut self.mm);
-            for (h, &g) in self.hb.iter_mut().zip(&self.hb2) {
-                let mut val = *h;
-                val *= 1.0 / (1.0 + libm::expf(-val));
-                val *= g;
-                *h = val;
-            }
-            matmul(&mut self.xb, &self.hb, &layer.w2, &mut self.mm);
+            matmul(&mut self.hb, &self.xb, &layer.w1, &mut self.mm, Input::New);
+            matmul(
+                &mut self.hb2,
+                &self.xb,
+                &layer.w3,
+                &mut self.mm,
+                Input::Same,
+            );
+            // SwiGLU, its `expf`s split across the workers: each element
+            // is the same function of its own inputs wherever it runs.
+            let gates = Shared::new(&mut self.hb);
+            let ups = &self.hb2;
+            for_each(self.mm.workers, ups.len(), |i| {
+                // SAFETY: each element goes to exactly one worker.
+                let h = unsafe { &mut gates.slice(i, 1)[0] };
+                *h = swiglu(*h, ups[i]);
+            });
+            matmul(&mut self.xb, &self.hb, &layer.w2, &mut self.mm, Input::New);
             for (x, &d) in self.x.iter_mut().zip(&self.xb) {
                 *x += d;
             }
@@ -684,7 +699,13 @@ impl<'a> Transformer<'a> {
         // borrow checker satisfied and changes no arithmetic.
         self.xb.copy_from_slice(&self.x);
         rmsnorm(&mut self.x, &self.xb, w.rms_final, c.norm_eps);
-        matmul(&mut self.logits, &self.x, &w.classifier, &mut self.mm);
+        matmul(
+            &mut self.logits,
+            &self.x,
+            &w.classifier,
+            &mut self.mm,
+            Input::New,
+        );
 
         let ended = self.mm.now();
         let phases = self.mm.phases();
@@ -739,69 +760,95 @@ impl<'a> Transformer<'a> {
         self.mm.in_prefill = true;
         let started = self.mm.now();
 
-        let mut x = vec![0.0f32; n * dim];
-        let mut xb = vec![0.0f32; n * dim];
-        let mut xb2 = vec![0.0f32; n * dim];
-        let mut q = vec![0.0f32; n * dim];
-        let mut hb = vec![0.0f32; n * hidden];
-        let mut hb2 = vec![0.0f32; n * hidden];
-        let mut att = vec![0.0f32; n * c.n_heads * ctx];
+        // The batch's buffers, kept between calls rather than allocated
+        // and zeroed for each: every element is written before it is read.
+        let mut buffers = core::mem::take(&mut self.batch);
+        buffers.reserve(n, &c, ctx);
+        let half = head_size / 2;
+        let BatchBuffers {
+            x,
+            xb,
+            xb2,
+            q,
+            hb,
+            hb2,
+            att,
+            angles,
+        } = &mut buffers;
+        let (x, xb, xb2, q) = (
+            &mut x[..n * dim],
+            &mut xb[..n * dim],
+            &mut xb2[..n * dim],
+            &mut q[..n * dim],
+        );
+        let (hb, hb2) = (&mut hb[..n * hidden], &mut hb2[..n * hidden]);
+        let workers = self.mm.workers;
 
         for (t, &token) in tokens.iter().enumerate() {
             w.token_embedding
                 .row_into(token as usize, &mut x[t * dim..(t + 1) * dim]);
+            // Each token's RoPE angles, once for every layer.
+            rope_angles(
+                c.rope_theta,
+                head_size,
+                pos0 + t,
+                &mut angles[t * half..(t + 1) * half],
+            );
         }
+        let angles = &angles[..n * half];
 
         for (l, layer) in w.layers.iter().enumerate() {
-            for t in 0..n {
-                let row = t * dim..(t + 1) * dim;
-                rmsnorm(&mut xb[row.clone()], &x[row], layer.rms_att, c.norm_eps);
-            }
+            // The per-token steps run token by token across the workers:
+            // each token's arithmetic is exactly `forward`'s, wherever it
+            // runs.
+            per_token(workers, xb, dim, |t, xb| {
+                rmsnorm(xb, &x[t * dim..(t + 1) * dim], layer.rms_att, c.norm_eps);
+            });
 
             // The batch's keys and values go straight into the cache: its
             // positions are consecutive, so their rows are too.
             let base = l * ctx * kv_dim;
             let at = base + pos0 * kv_dim;
-            matmul_batch(&mut q, &xb, &layer.wq, &mut self.mm);
+            matmul_batch(q, xb, &layer.wq, &mut self.mm, Input::New);
             matmul_batch(
                 &mut self.key_cache[at..at + n * kv_dim],
-                &xb,
+                xb,
                 &layer.wk,
                 &mut self.mm,
+                Input::Same,
             );
             matmul_batch(
                 &mut self.value_cache[at..at + n * kv_dim],
-                &xb,
+                xb,
                 &layer.wv,
                 &mut self.mm,
+                Input::Same,
             );
 
-            // RoPE, token by token, each at its own position.
-            for t in 0..n {
-                let pos = pos0 + t;
-                let k = &mut self.key_cache[at + t * kv_dim..at + (t + 1) * kv_dim];
-                let qt = &mut q[t * dim..(t + 1) * dim];
+            // RoPE, each token at its own position.
+            let keys = Shared::new(&mut self.key_cache[at..at + n * kv_dim]);
+            per_token(workers, q, dim, |t, qt| {
+                // SAFETY: token `t`'s key row is its own.
+                let k = unsafe { keys.slice(t * kv_dim, kv_dim) };
+                let angles = &angles[t * half..(t + 1) * half];
                 for i in (0..dim).step_by(2) {
-                    let head_dim = i % head_size;
-                    let freq = 1.0 / libm::powf(c.rope_theta, head_dim as f32 / head_size as f32);
-                    let val = pos as f32 * freq;
-                    let (fcr, fci) = (libm::cosf(val), libm::sinf(val));
+                    let (fcr, fci) = angles[(i % head_size) / 2];
                     rotate(&mut qt[i..i + 2], fcr, fci);
                     if i < kv_dim {
                         rotate(&mut k[i..i + 2], fcr, fci);
                     }
                 }
-            }
+            });
 
             // Attention: every (token, head) pair a job of its own, each
             // the same arithmetic `forward` does for that head at that
             // token's position.
             let attention_started = self.mm.now();
             let scale = libm::sqrtf(head_size as f32);
-            let scores = Shared::new(&mut att);
-            let outputs = Shared::new(&mut xb);
-            let (queries, keys, values) = (&q, &self.key_cache, &self.value_cache);
-            for_each(self.mm.workers, n * c.n_heads, |i| {
+            let scores = Shared::new(&mut att[..n * c.n_heads * ctx]);
+            let outputs = Shared::new(xb);
+            let (queries, keys, values) = (&*q, &self.key_cache, &self.value_cache);
+            for_each(workers, n * c.n_heads, |i| {
                 let (t, h) = (i / c.n_heads, i % c.n_heads);
                 let pos = pos0 + t;
                 let qh = &queries[t * dim + h * head_size..t * dim + (h + 1) * head_size];
@@ -831,28 +878,34 @@ impl<'a> Transformer<'a> {
             let attention_ended = self.mm.now();
             self.mm.phases().attention += attention_ended - attention_started;
 
-            matmul_batch(&mut xb2, &xb, &layer.wo, &mut self.mm);
-            for (x, &d) in x.iter_mut().zip(&xb2) {
-                *x += d;
-            }
+            matmul_batch(xb2, xb, &layer.wo, &mut self.mm, Input::New);
 
-            for t in 0..n {
-                let row = t * dim..(t + 1) * dim;
-                rmsnorm(&mut xb[row.clone()], &x[row], layer.rms_ffn, c.norm_eps);
-            }
-            matmul_batch(&mut hb, &xb, &layer.w1, &mut self.mm);
-            matmul_batch(&mut hb2, &xb, &layer.w3, &mut self.mm);
-            for (h, &g) in hb.iter_mut().zip(&hb2) {
-                let mut val = *h;
-                val *= 1.0 / (1.0 + libm::expf(-val));
-                val *= g;
-                *h = val;
-            }
-            matmul_batch(&mut xb, &hb, &layer.w2, &mut self.mm);
-            for (x, &d) in x.iter_mut().zip(&xb) {
-                *x += d;
-            }
+            // The residual add and the feed-forward RMSNorm, per token.
+            let normed = Shared::new(xb);
+            per_token(workers, x, dim, |t, xt| {
+                for (x, &d) in xt.iter_mut().zip(&xb2[t * dim..(t + 1) * dim]) {
+                    *x += d;
+                }
+                // SAFETY: token `t`'s row of `xb` is its own.
+                let out = unsafe { normed.slice(t * dim, dim) };
+                rmsnorm(out, xt, layer.rms_ffn, c.norm_eps);
+            });
+
+            matmul_batch(hb, xb, &layer.w1, &mut self.mm, Input::New);
+            matmul_batch(hb2, xb, &layer.w3, &mut self.mm, Input::Same);
+            per_token(workers, hb, hidden, |t, gates| {
+                for (h, &g) in gates.iter_mut().zip(&hb2[t * hidden..(t + 1) * hidden]) {
+                    *h = swiglu(*h, g);
+                }
+            });
+            matmul_batch(xb, hb, &layer.w2, &mut self.mm, Input::New);
+            per_token(workers, x, dim, |t, xt| {
+                for (x, &d) in xt.iter_mut().zip(&xb[t * dim..(t + 1) * dim]) {
+                    *x += d;
+                }
+            });
         }
+        self.batch = buffers;
 
         let ended = self.mm.now();
         let phases = self.mm.phases();
@@ -876,6 +929,104 @@ fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     }
 }
 
+/// Runs `f(t, row)` for every token `t` of a batch, `row` being token
+/// `t`'s `width` elements of `rows`, the tokens split across `workers`.
+fn per_token(
+    workers: &dyn Workers,
+    rows: &mut [f32],
+    width: usize,
+    f: impl Fn(usize, &mut [f32]) + Sync,
+) {
+    let tokens = rows.len() / width;
+    let rows = Shared::new(rows);
+    for_each(workers, tokens, |t| {
+        // SAFETY: each token's row goes to exactly one worker.
+        f(t, unsafe { rows.slice(t * width, width) });
+    });
+}
+
+/// The buffers [`Transformer::prefill`] works in, kept between calls and
+/// grown to the largest batch seen.
+#[derive(Default)]
+struct BatchBuffers {
+    /// The residual stream, `(tokens, dim)`.
+    x: Vec<f32>,
+    /// Inside a residual branch, `(tokens, dim)`.
+    xb: Vec<f32>,
+    /// A second branch buffer, `(tokens, dim)`.
+    xb2: Vec<f32>,
+    /// The queries, `(tokens, dim)`.
+    q: Vec<f32>,
+    /// The feed-forward layer's hidden activations, `(tokens, hidden_dim)`.
+    hb: Vec<f32>,
+    /// The same, for the gate's second projection.
+    hb2: Vec<f32>,
+    /// Attention scores, `(tokens, n_heads, context)`.
+    att: Vec<f32>,
+    /// Each token's RoPE angles, `(tokens, head_size / 2)`.
+    angles: Vec<(f32, f32)>,
+}
+
+impl BatchBuffers {
+    /// Grows the buffers to hold a batch of `n` tokens, if they do not
+    /// already. Their contents are left as they are: every element a batch
+    /// reads, it has written first.
+    fn reserve(&mut self, n: usize, c: &Config, context: usize) {
+        let grow = |v: &mut Vec<f32>, len: usize| {
+            if v.len() < len {
+                v.resize(len, 0.0);
+            }
+        };
+        grow(&mut self.x, n * c.dim);
+        grow(&mut self.xb, n * c.dim);
+        grow(&mut self.xb2, n * c.dim);
+        grow(&mut self.q, n * c.dim);
+        grow(&mut self.hb, n * c.hidden_dim);
+        grow(&mut self.hb2, n * c.hidden_dim);
+        grow(&mut self.att, n * c.n_heads * context);
+        let half = c.head_size() / 2;
+        if self.angles.len() < n * half {
+            self.angles.resize(n * half, (0.0, 0.0));
+        }
+    }
+}
+
+/// The largest head this engine computes RoPE for, which sizes its table
+/// of angles: SmolLM2's heads are 64 wide, stories15M's 48.
+const MAX_HEAD_SIZE: usize = 256;
+
+/// RoPE's rotation for every pair of a head at position `pos`, as
+/// `(cos, sin)`: `out[p]` for the pair starting at element `2p`.
+///
+/// The same expressions `run.c` evaluates per pair, per layer — computed
+/// once per position instead of once per layer, which gives the same bits
+/// and saves all but one layer's `powf`, `cosf` and `sinf`.
+///
+/// # Panics
+///
+/// If `head_size` is more than [`MAX_HEAD_SIZE`].
+fn rope_angles(theta: f32, head_size: usize, pos: usize, out: &mut [(f32, f32)]) {
+    assert!(
+        head_size <= MAX_HEAD_SIZE,
+        "a head wider than {MAX_HEAD_SIZE}"
+    );
+    for (p, angle) in out.iter_mut().enumerate() {
+        let head_dim = 2 * p;
+        let freq = 1.0 / libm::powf(theta, head_dim as f32 / head_size as f32);
+        let val = pos as f32 * freq;
+        *angle = (libm::cosf(val), libm::sinf(val));
+    }
+}
+
+/// SwiGLU for one element: `silu(gate) * up`, in `run.c`'s operation
+/// order.
+fn swiglu(gate: f32, up: f32) -> f32 {
+    let mut val = gate;
+    val *= 1.0 / (1.0 + libm::expf(-val));
+    val *= up;
+    val
+}
+
 /// In-place softmax, max-subtracted for stability.
 fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(x[0], f32::max);
@@ -889,6 +1040,22 @@ fn softmax(x: &mut [f32]) {
     }
 }
 
+/// Whether a matrix multiply's input is new, or the one the previous
+/// matrix multiply was given.
+///
+/// Several matrices take the same input — the query, key and value
+/// projections; the feed-forward layer's gate and up projections — and
+/// quantizing it once for all of them gives every one the same quantized
+/// input it would have computed itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Input {
+    /// Quantize it.
+    New,
+    /// Reuse the previous call's quantization: the caller promises the
+    /// input is the same values.
+    Same,
+}
+
 /// How many bytes of weights each worker takes at a time when a matrix's
 /// rows are dealt out: see [`for_rows`] for why it is a few KiB.
 const CHUNK_BYTES: usize = 4096;
@@ -899,7 +1066,7 @@ const CHUNK_BYTES: usize = 4096;
 /// Where nearly all the time goes. An F32 matrix is the plain loop llama2.c
 /// has; a Q8_0 matrix quantizes `x` once, as ggml does, and every worker
 /// takes its quads' dot products with [`quant::dot4`] against that.
-fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
+fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul, input: Input) {
     let started = mm.now();
     let mut quantizing = 0;
     match *w {
@@ -914,8 +1081,10 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
             scales,
             cols,
         } => {
-            quant::quantize(x, &mut mm.scratch);
-            quantizing = mm.now() - started;
+            if input == Input::New {
+                quant::quantize(x, &mut mm.scratch);
+                quantizing = mm.now() - started;
+            }
             let per_row = cols / BLOCK;
             let scratch = &mm.scratch;
             let quads = out.len() / QUAD;
@@ -957,7 +1126,7 @@ fn quads_per_chunk(cols: usize) -> usize {
 /// computes all of a row's tokens while the row is in hand — for Q8_0 a
 /// quad of rows at a time with [`quant::gemm4`], whose results are the same
 /// bits [`quant::dot4`] gives one token at a time.
-fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
+fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul, input: Input) {
     let cols = w.cols();
     let n = xs.len() / cols;
     let rows = out.len() / n;
@@ -982,8 +1151,10 @@ fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
             scales,
             cols,
         } => {
-            quant::quantize_batch(xs, cols, &mut mm.batch);
-            quantizing = mm.now() - started;
+            if input == Input::New {
+                quant::quantize_batch(mm.workers, xs, cols, &mut mm.batch);
+                quantizing = mm.now() - started;
+            }
             let per_row = cols / BLOCK;
             let batch = &mm.batch;
             for_chunks(mm.workers, rows / QUAD, quads_per_chunk(cols), |q| {

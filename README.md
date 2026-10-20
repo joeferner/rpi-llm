@@ -66,9 +66,12 @@ models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  11
 Write a short story about a robot who learns to paint.<|im_end|>
 <|im_start|>assistant
 Once upon a time, there was a robot named Robo who was very smart ...
-[   43.554] chat: prompt 42 tokens in 0.39 s, 106.5 tok/s
-[   43.557] chat: answer 200 tokens in 7.77 s, 25.6 tok/s
-[   43.587] reference: all 200 tokens match the host engine
+[   42.604] chat: prompt 42 tokens in 0.21 s, 203.3 tok/s
+[   42.607] chat: answer 200 tokens in 7.02 s, 28.4 tok/s
+[   42.612] phases: prompt: 1 calls in 173.5 ms: quantize 9.2, matmul 115.5, attention 29.5, other 19.2
+[   42.621] phases: answer: 200 calls in 7032.3 ms: quantize 136.4, matmul 5975.2, attention 755.6, other 165.2
+...
+[   42.656] reference: all 200 tokens match the host engine
 ```
 
 `make test` runs the engine's tests on the development machine (the
@@ -83,7 +86,7 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 
 | | Load | Prompt | Answer |
 |---|---|---|---|
-| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 106.5 tok/s | 25.6 tok/s |
+| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 203.3 tok/s | 28.4 tok/s |
 | rpi-llm, Linux, 4 threads | 4.37 s (88 MB/s) | 27.6 tok/s | 25.9 tok/s |
 | rpi-llm, Linux, 1 thread | 4.42 s | 26.0 tok/s | 22.3 tok/s |
 | llama.cpp, Linux, 4 threads | 5.05 s (77 MB/s) | 261.3 tok/s | 25.2 tok/s |
@@ -100,23 +103,31 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
   defaults; `rpi-llm` on Linux is the same engine as the board's, built as
   an ordinary program ([bench/](bench/)).
 - The `rpi-llm` Linux rows were measured before the engine batched its
-  prompt; the bare-metal row is with batching and the 4x4 kernel (it was
-  28.5 tok/s for the prompt and 25.5 for the answer before both).
+  prompt; the bare-metal row is with batching, the 4x4 kernel and the
+  per-token work spread across the cores (it was 28.5 tok/s for the
+  prompt and 25.5 for the answer before all three).
+- The `phases:` lines split the time inside the model: quantizing
+  activations to 8 bits, the weight matrix multiplies, attention, and
+  everything else (normalization, RoPE, SwiGLU, residual adds).
 
 What the numbers say:
 
-- **Generation is at parity.** Every configuration meets the same limit,
+- **Generation is at parity, a little ahead.** Every configuration meets
+  the same limit,
   the memory: a token reads every weight once, and four cores together
   read at most 13.9 GB/s (one alone reads 14.0), which `make bandwidth`
   measures. Splitting each matrix's rows across the cores in interleaved
   4 KiB chunks rather than contiguous quarters is what gets near that.
-- **The prompt is 2.5x behind llama.cpp.** Both push all the prompt's
+- **The prompt is 1.3x behind llama.cpp.** Both push all the prompt's
   tokens through each weight matrix together, so each weight is read once
   for the whole prompt, and both use the same kernel layout: four rows'
   weights interleaved so that one `sdot` serves four rows of one token, in
   tiles of 4 rows by 4 tokens. Batching took this engine from 28.5 to
-  89.9 tok/s and the kernel to 106.5; where the rest of the time goes is
-  being measured.
+  89.9 tok/s and the kernel to 106.5. The phase timing then showed most
+  of the rest running on core 0 alone: quantizing the activations, and
+  the per-token normalization, RoPE and SwiGLU. Moving those onto all
+  four cores, quantizing each shared input once, and rounding with the
+  hardware's instruction took it to 203.3.
 - **The load is 7x behind Linux**, whose SD driver runs the card in a
   fast UHS mode while rpi-hal's stays at default speed.
 

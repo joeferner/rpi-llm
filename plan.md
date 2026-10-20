@@ -138,16 +138,11 @@ cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
 
 ## Build order
 
-1. Find where the prompt's time goes outside the kernel. The prompt is
-   batched (`Transformer::prefill`) and runs llama.cpp's 4-row by 4-token
-   kernel layout, still bit-identical: 106.5 tok/s (28.5 unbatched, 89.9
-   with a 1-row kernel), against llama.cpp's 261. The kernel change gained
-   only 18%, so most of the time is likely elsewhere. The first suspect
-   is quantizing the activations: serial on core 0, through software
-   `roundf`, and repeated for matrices that share an input (query, key and
-   value; gate and up). Time the phases first, then fix what dominates.
-   Generation (25.6 tok/s) is memory-bound, but quantizes the same way
-   for every token.
+1. Close the rest of the prompt gap: 203.3 tok/s against llama.cpp's 261.
+   The prompt's 173.5 ms is now matmul 115.5, attention 29.5, other 19.2,
+   quantize 9.2. Attention is still scalar code, and is also the largest
+   cost in generation outside the multiplies (756 ms of 7032, 28.4
+   tok/s): vectorize it with NEON first, then look at the 4x4 kernel.
 2. Fan control, then rerun the baseline above for the final side-by-side.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

@@ -37,26 +37,32 @@ impl Workers for Serial {
 
 /// A buffer the workers share, each writing only its own part of it.
 ///
-/// Made from a `&mut [f32]` the caller holds for as long as the workers
+/// Made from a `&mut [T]` the caller holds for as long as the workers
 /// run, which keeps everything else away from it meanwhile; the workers'
 /// parts being disjoint is the caller's to guarantee, and every accessor
 /// is `unsafe` for that reason.
-pub(crate) struct Shared {
-    ptr: *mut f32,
+pub(crate) struct Shared<T> {
+    ptr: *mut T,
     len: usize,
 }
 
 // SAFETY: see `Shared`: the workers only reach it through accessors whose
-// callers promise disjoint parts.
-unsafe impl Sync for Shared {}
+// callers promise disjoint parts, and the elements themselves must be
+// sendable between workers.
+unsafe impl<T: Send> Sync for Shared<T> {}
 
-impl Shared {
+impl<T> Shared<T> {
     /// Shares `buf`.
-    pub(crate) fn new(buf: &mut [f32]) -> Self {
+    pub(crate) fn new(buf: &mut [T]) -> Self {
         Self {
             ptr: buf.as_mut_ptr(),
             len: buf.len(),
         }
+    }
+
+    /// Elements in the buffer.
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
     /// Elements `start..start + len`, writable.
@@ -70,7 +76,7 @@ impl Shared {
     /// The range must be inside the buffer, and no other worker may touch
     /// it while the returned slice lives.
     #[allow(clippy::mut_from_ref, reason = "disjointness is the caller's promise")]
-    pub(crate) unsafe fn slice(&self, start: usize, len: usize) -> &mut [f32] {
+    pub(crate) unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
         assert!(start + len <= self.len, "a shared slice out of bounds");
         // SAFETY: in bounds (checked); exclusive by the caller's promise.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.add(start), len) }
@@ -106,7 +112,7 @@ pub(crate) fn for_rows(
     row: impl Fn(usize) -> f32 + Sync,
 ) {
     let rows = Shared::new(out);
-    for_chunks(workers, rows.len, chunk, |r| {
+    for_chunks(workers, rows.len(), chunk, |r| {
         // SAFETY: each row index goes to exactly one worker.
         unsafe { rows.slice(r, 1)[0] = row(r) };
     });

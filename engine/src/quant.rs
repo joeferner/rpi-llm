@@ -43,6 +43,8 @@
 
 use alloc::vec::Vec;
 
+use crate::parallel::{Shared, Workers, for_each};
+
 /// Values in one block.
 pub const BLOCK: usize = 32;
 /// Bytes in one block as a file stores it: the `f16` scale, then the 32
@@ -255,15 +257,50 @@ pub fn quantize(x: &[f32], out: &mut Quantized) {
     out.scales.clear();
     out.values.clear();
     for (b, block) in x.as_chunks::<BLOCK>().0.iter().enumerate() {
-        let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let d = amax / 127.0;
-        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let (scale, values) = quantize_block(block);
         if b % 4 == 0 {
             out.scales.push(Scales::default());
         }
-        out.scales[b / 4].0[b % 4] = f16_to_f32(f32_to_f16(d));
-        out.values
-            .push(Block(block.map(|v| libm::roundf(v * id) as i8)));
+        out.scales[b / 4].0[b % 4] = scale;
+        out.values.push(values);
+    }
+}
+
+/// One block of [`quantize`]: its scale (already rounded through `f16`)
+/// and its values.
+fn quantize_block(block: &[f32; BLOCK]) -> (f32, Block) {
+    let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let d = amax / 127.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let values = block.map(|v| round_away(v * id).clamp(-128, 127) as i8);
+    (f16_to_f32(f32_to_f16(d)), Block(values))
+}
+
+/// `v` rounded to the nearest integer, halves away from zero: C's `roundf`,
+/// which ggml's quantizer uses.
+///
+/// On AArch64 that is one instruction, `fcvtas`, whose rounding rule is
+/// exactly `roundf`'s; `libm`'s `roundf` is a software routine, and it was
+/// a large part of the time the prompt spent quantizing.
+#[inline(always)]
+fn round_away(v: f32) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let r: i32;
+        // SAFETY: a register-to-register conversion, no memory touched.
+        unsafe {
+            core::arch::asm!(
+                "fcvtas {r:w}, {v:s}",
+                v = in(vreg) v,
+                r = lateout(reg) r,
+                options(pure, nomem, nostack),
+            );
+        }
+        r
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        libm::roundf(v) as i32
     }
 }
 
@@ -320,8 +357,6 @@ pub struct Batch {
     values: Vec<Quad>,
     /// Their four scales, at the same index.
     scales: Vec<Scales>,
-    /// One token's quantization, before it is spread into the batch.
-    one: Quantized,
 }
 
 impl Batch {
@@ -331,7 +366,8 @@ impl Batch {
     }
 }
 
-/// Quantizes `xs`, consecutive vectors of `n` values each, into `out`.
+/// Quantizes `xs`, consecutive vectors of `n` values each, into `out`, the
+/// vectors split across `workers`.
 ///
 /// Each vector is quantized exactly as [`quantize`] does it, so its blocks
 /// and scales are the ones a single-token matrix multiply would use.
@@ -340,30 +376,58 @@ impl Batch {
 ///
 /// If `n` is not a multiple of [`BLOCK`] or `xs` not a whole number of
 /// vectors.
-pub fn quantize_batch(xs: &[f32], n: usize, out: &mut Batch) {
+pub fn quantize_batch(workers: &dyn Workers, xs: &[f32], n: usize, out: &mut Batch) {
     assert!(xs.len().is_multiple_of(n), "whole vectors");
     let real = xs.len() / n;
     let tokens = real.next_multiple_of(LANES);
     let groups = tokens / LANES;
     let blocks = n / BLOCK;
     out.tokens = tokens;
+    // Zeroed, for the padding tokens; the real ones overwrite their parts.
     out.values.clear();
     out.values.resize(blocks * groups, Quad([0; QUAD * BLOCK]));
     out.scales.clear();
     out.scales.resize(blocks * groups, Scales::default());
-    for (t, x) in xs.chunks_exact(n).enumerate() {
-        quantize(x, &mut out.one);
+
+    // Four tokens share each quad and each group of scales, each writing
+    // its own bytes and lane, so the workers reach them as bytes and
+    // lanes: never two `&mut` to one whole quad.
+    // SAFETY: `Quad` and `Scales` are plain arrays of `i8` and `f32`
+    // (`repr(C)`), so their storage is exactly that many of those.
+    let (value_bytes, scale_lanes) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(
+                out.values.as_mut_ptr().cast::<i8>(),
+                out.values.len() * QUAD * BLOCK,
+            ),
+            core::slice::from_raw_parts_mut(
+                out.scales.as_mut_ptr().cast::<f32>(),
+                out.scales.len() * 4,
+            ),
+        )
+    };
+    let values = Shared::new(value_bytes);
+    let scales = Shared::new(scale_lanes);
+    for_each(workers, real, |t| {
         let (g, m) = (t / LANES, t % LANES);
-        for b in 0..blocks {
+        let x = &xs[t * n..(t + 1) * n];
+        for (b, block) in x.as_chunks::<BLOCK>().0.iter().enumerate() {
+            let (scale, q) = quantize_block(block);
             let at = b * groups + g;
-            let block = &out.one.values[b].0;
             for k in 0..BLOCK / 4 {
-                out.values[at].0[k * 16 + m * 4..k * 16 + m * 4 + 4]
-                    .copy_from_slice(&block[4 * k..4 * k + 4]);
+                // SAFETY: token `t` alone writes bytes `m * 4..m * 4 + 4`
+                // of each 16-byte group of this quad, and lane `m` of its
+                // scales; each token runs on one worker.
+                unsafe {
+                    values
+                        .slice(at * QUAD * BLOCK + k * 16 + m * 4, 4)
+                        .copy_from_slice(&q.0[4 * k..4 * k + 4]);
+                }
             }
-            out.scales[at].0[m] = out.one.scale(b);
+            // SAFETY: as above.
+            unsafe { scales.slice(at * 4 + m, 1)[0] = scale };
         }
-    }
+    });
 }
 
 /// Four rows' dot products with every vector in `x`, into `out` (one
@@ -666,7 +730,7 @@ mod tests {
         // Six tokens: one full group of four and a padded one.
         let xs: Vec<f32> = (0..6 * COLS).map(|i| (i as f32 * 0.37).sin()).collect();
         let mut batch = Batch::default();
-        quantize_batch(&xs, COLS, &mut batch);
+        quantize_batch(&crate::parallel::Serial, &xs, COLS, &mut batch);
         let mut q = Quantized::default();
 
         for quad in 0..ROWS / QUAD {
