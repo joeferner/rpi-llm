@@ -66,9 +66,9 @@ models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  11
 Write a short story about a robot who learns to paint.<|im_end|>
 <|im_start|>assistant
 Once upon a time, there was a robot named Robo who was very smart ...
-[   43.395] chat: prompt 42 tokens in 0.47 s, 89.9 tok/s
-[   43.398] chat: answer 200 tokens in 7.67 s, 26.0 tok/s
-[   43.428] reference: all 200 tokens match the host engine
+[   43.554] chat: prompt 42 tokens in 0.39 s, 106.5 tok/s
+[   43.557] chat: answer 200 tokens in 7.77 s, 25.6 tok/s
+[   43.587] reference: all 200 tokens match the host engine
 ```
 
 `make test` runs the engine's tests on the development machine (the
@@ -83,7 +83,7 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 
 | | Load | Prompt | Answer |
 |---|---|---|---|
-| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 89.9 tok/s | 26.0 tok/s |
+| rpi-llm, bare metal, 4 cores | 32.9 s (11.7 MB/s) | 106.5 tok/s | 25.6 tok/s |
 | rpi-llm, Linux, 4 threads | 4.37 s (88 MB/s) | 27.6 tok/s | 25.9 tok/s |
 | rpi-llm, Linux, 1 thread | 4.42 s | 26.0 tok/s | 22.3 tok/s |
 | llama.cpp, Linux, 4 threads | 5.05 s (77 MB/s) | 261.3 tok/s | 25.2 tok/s |
@@ -100,8 +100,8 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
   defaults; `rpi-llm` on Linux is the same engine as the board's, built as
   an ordinary program ([bench/](bench/)).
 - The `rpi-llm` Linux rows were measured before the engine batched its
-  prompt; the bare-metal row is with batching (it was 28.5 tok/s for the
-  prompt and 25.5 for the answer before).
+  prompt; the bare-metal row is with batching and the 4x4 kernel (it was
+  28.5 tok/s for the prompt and 25.5 for the answer before both).
 
 What the numbers say:
 
@@ -110,12 +110,13 @@ What the numbers say:
   read at most 13.9 GB/s (one alone reads 14.0), which `make bandwidth`
   measures. Splitting each matrix's rows across the cores in interleaved
   4 KiB chunks rather than contiguous quarters is what gets near that.
-- **The prompt is 3x behind llama.cpp.** Both now push all the prompt's
+- **The prompt is 2.5x behind llama.cpp.** Both push all the prompt's
   tokens through each weight matrix together, so each weight is read once
-  for the whole prompt; that took this engine from 28.5 to 89.9 tok/s.
-  The rest of the gap is the kernel: llama.cpp interleaves four rows'
-  weights so that one `sdot` serves four rows of one token, and works in
-  tiles of 4 rows by 4 tokens.
+  for the whole prompt, and both use the same kernel layout: four rows'
+  weights interleaved so that one `sdot` serves four rows of one token, in
+  tiles of 4 rows by 4 tokens. Batching took this engine from 28.5 to
+  89.9 tok/s and the kernel to 106.5; where the rest of the time goes is
+  being measured.
 - **The load is 7x behind Linux**, whose SD driver runs the card in a
   fast UHS mode while rpi-hal's stays at default speed.
 

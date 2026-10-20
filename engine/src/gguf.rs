@@ -27,6 +27,9 @@ pub enum GgufError {
     NotUtf8,
     /// A tensor's data lies outside the file.
     TensorBounds,
+    /// A Q8_0 tensor cannot be repacked: its rows do not come in fours, or
+    /// are not whole blocks. The index is the tensor's, in file order.
+    NotRepackable(usize),
 }
 
 /// A metadata value's type, as GGUF numbers them.
@@ -334,17 +337,21 @@ impl<'a> Gguf<'a> {
     /// Repacking needs scratch space the size of the largest Q8_0 tensor,
     /// for as long as it takes to rearrange that tensor.
     pub fn parse_repacked(file: &'a mut [u8]) -> Result<Repacked<'a>, GgufError> {
-        let ranges: Vec<(usize, usize)> = Gguf::parse(file)?
+        // Each Q8_0 tensor's place in the file, its row width, and its index.
+        let tensors: Vec<(usize, usize, usize, usize)> = Gguf::parse(file)?
             .tensors
             .iter()
-            .filter(|t| t.kind == TensorType::Q8_0)
-            .map(|t| {
+            .enumerate()
+            .filter(|(_, t)| t.kind == TensorType::Q8_0)
+            .map(|(i, t)| {
                 let start = t.data.as_ptr() as usize - file.as_ptr() as usize;
-                (start, start + t.data.len())
+                (start, start + t.data.len(), t.dims[0] as usize, i)
             })
             .collect();
-        for (start, end) in ranges {
-            crate::quant::repack(&mut file[start..end]);
+        for (start, end, cols, index) in tensors {
+            if !crate::quant::repack(&mut file[start..end], cols) {
+                return Err(GgufError::NotRepackable(index));
+            }
         }
         let file: &'a [u8] = file;
         Ok(Repacked(Gguf::parse(file)?))

@@ -138,16 +138,16 @@ cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
 
 ## Build order
 
-1. A 4-row by 4-token prompt kernel. The prompt is batched now
-   (`Transformer::prefill`): 89.9 tok/s, up from 28.5, against llama.cpp's
-   261. That is about a tenth of what four cores' `sdot` can do: each
-   weight block meets only four tokens, so every 8 `sdot`s take 10 vector
-   loads and 3 reductions. Interleaving four rows' weights in 4-byte
-   groups lets one `sdot` against one token's bytes produce four rows'
-   sums with no reduction, and a 4x4 tile reuses each load four times —
-   llama.cpp's layout for this. The integer sums stay exact and the
-   scaling unchanged, so it can stay bit-identical. Generation is
-   memory-bound at 26.0 tok/s and is not this step's to change.
+1. Find where the prompt's time goes outside the kernel. The prompt is
+   batched (`Transformer::prefill`) and runs llama.cpp's 4-row by 4-token
+   kernel layout, still bit-identical: 106.5 tok/s (28.5 unbatched, 89.9
+   with a 1-row kernel), against llama.cpp's 261. The kernel change gained
+   only 18%, so most of the time is likely elsewhere. The first suspect
+   is quantizing the activations: serial on core 0, through software
+   `roundf`, and repeated for matrices that share an input (query, key and
+   value; gate and up). Time the phases first, then fix what dominates.
+   Generation (25.6 tok/s) is memory-bound, but quantizes the same way
+   for every token.
 2. Fan control, then rerun the baseline above for the final side-by-side.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector

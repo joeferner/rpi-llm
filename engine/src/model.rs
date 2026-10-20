@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use crate::gguf::{Gguf, Repacked, Tensor, TensorType};
 use crate::llama2::{self, FormatError, HEADER_BYTES};
 use crate::parallel::{Serial, Shared, Workers, for_chunks, for_each, for_rows};
-use crate::quant::{self, BLOCK, Block, Quantized};
+use crate::quant::{self, BLOCK, QUAD, Quad, QuadScales, Quantized};
 
 /// A model's shape and the constants its arithmetic needs.
 #[derive(Clone, Copy, Debug)]
@@ -110,12 +110,13 @@ pub enum Matrix<'a> {
         /// Elements per row.
         cols: usize,
     },
-    /// Q8_0, repacked (see [`crate::quant`]): `cols / 32` blocks per row.
+    /// Q8_0, repacked four rows at a time (see [`crate::quant`]): each quad
+    /// of rows is `cols / 32` [`Quad`]s.
     Q8_0 {
-        /// Every block's values, row by row.
-        values: &'a [Block],
-        /// Every block's `f16` scale, in the same order.
-        scales: &'a [u16],
+        /// Every quad's blocks, quad by quad.
+        values: &'a [Quad],
+        /// Their scales, in the same order.
+        scales: &'a [QuadScales],
         /// Elements per row.
         cols: usize,
     },
@@ -138,8 +139,9 @@ impl Matrix<'_> {
                 scales,
                 cols,
             } => {
-                let row = cols / BLOCK * i..cols / BLOCK * (i + 1);
-                quant::dequantize(&values[row.clone()], &scales[row], out);
+                let per_row = cols / BLOCK;
+                let quad = i / QUAD * per_row..(i / QUAD + 1) * per_row;
+                quant::dequantize_row(&values[quad.clone()], &scales[quad], i % QUAD, out);
             }
         }
     }
@@ -313,7 +315,7 @@ impl<'a> Weights<'a> {
                     data: f32_view(t)?,
                     cols,
                 }),
-                TensorType::Q8_0 if cols.is_multiple_of(BLOCK) => {
+                TensorType::Q8_0 if cols.is_multiple_of(BLOCK) && rows.is_multiple_of(QUAD) => {
                     let (values, scales) = quant::repacked(t.data)
                         .ok_or_else(|| ModelError::Misaligned(name.into()))?;
                     Ok(Matrix::Q8_0 {
@@ -791,7 +793,7 @@ const CHUNK_BYTES: usize = 4096;
 ///
 /// Where nearly all the time goes. An F32 matrix is the plain loop llama2.c
 /// has; a Q8_0 matrix quantizes `x` once, as ggml does, and every worker
-/// takes its rows' dot products with [`quant::dot`] against that.
+/// takes its quads' dot products with [`quant::dot4`] against that.
 fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
     match *w {
         Matrix::F32 { data, cols } => {
@@ -808,24 +810,33 @@ fn matmul(out: &mut [f32], x: &[f32], w: &Matrix, mm: &mut MatMul) {
             quant::quantize(x, &mut mm.scratch);
             let per_row = cols / BLOCK;
             let scratch = &mm.scratch;
-            // A row's values are a byte each; its scales are a sixteenth
-            // as much again, in a separate array.
-            let chunk = CHUNK_BYTES / cols;
-            for_rows(mm.workers, out, chunk, |i| {
-                let row = i * per_row..(i + 1) * per_row;
-                quant::dot(&values[row.clone()], &scales[row], scratch)
+            let quads = out.len() / QUAD;
+            let outputs = Shared::new(out);
+            for_chunks(mm.workers, quads, quads_per_chunk(cols), |q| {
+                let quad = q * per_row..(q + 1) * per_row;
+                let sums = quant::dot4(&values[quad.clone()], &scales[quad], scratch);
+                // SAFETY: quad `q` goes to exactly one worker, and its
+                // outputs are rows `4q..4q + 4`.
+                unsafe { outputs.slice(QUAD * q, QUAD) }.copy_from_slice(&sums);
             });
         }
     }
+}
+
+/// How many quads of `cols`-wide Q8_0 rows make up about [`CHUNK_BYTES`]
+/// of weights, at least one: a row's values are a byte each, and its scales
+/// a sixteenth as much again in a separate array.
+fn quads_per_chunk(cols: usize) -> usize {
+    (CHUNK_BYTES / (QUAD * cols)).max(1)
 }
 
 /// [`matmul`] for a batch: `xs` holds one input vector per token, and
 /// `out` gets token `t`'s output for row `r` at `t * rows + r`.
 ///
 /// The rows are dealt out to the workers as in [`matmul`], and each worker
-/// computes all of a row's tokens while the row is in hand — for Q8_0 with
-/// [`quant::dot_batch`], whose results are the same bits [`quant::dot`]
-/// gives one token at a time.
+/// computes all of a row's tokens while the row is in hand — for Q8_0 a
+/// quad of rows at a time with [`quant::gemm4`], whose results are the same
+/// bits [`quant::dot4`] gives one token at a time.
 fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
     let cols = w.cols();
     let n = xs.len() / cols;
@@ -852,13 +863,15 @@ fn matmul_batch(out: &mut [f32], xs: &[f32], w: &Matrix, mm: &mut MatMul) {
             quant::quantize_batch(xs, cols, &mut mm.batch);
             let per_row = cols / BLOCK;
             let batch = &mm.batch;
-            for_chunks(mm.workers, rows, CHUNK_BYTES / cols, |r| {
-                let row = r * per_row..(r + 1) * per_row;
-                let mut sums = [0.0f32; Transformer::MAX_BATCH];
-                quant::dot_batch(&values[row.clone()], &scales[row], batch, &mut sums);
-                for (t, &sum) in sums.iter().enumerate().take(n) {
-                    // SAFETY: as above.
-                    unsafe { outputs.slice(t * rows + r, 1)[0] = sum };
+            for_chunks(mm.workers, rows / QUAD, quads_per_chunk(cols), |q| {
+                let quad = q * per_row..(q + 1) * per_row;
+                let mut sums = [[0.0f32; QUAD]; Transformer::MAX_BATCH];
+                quant::gemm4(&values[quad.clone()], &scales[quad], batch, &mut sums);
+                for (t, sums) in sums.iter().enumerate().take(n) {
+                    // SAFETY: quad `q` goes to exactly one worker, and
+                    // token `t`'s outputs for its rows are
+                    // `t * rows + 4q..t * rows + 4q + 4`.
+                    unsafe { outputs.slice(t * rows + QUAD * q, QUAD) }.copy_from_slice(sums);
                 }
             });
         }
