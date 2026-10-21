@@ -166,28 +166,35 @@ fn free_running_generation_matches_the_recorded_engine_output() {
     let Some(mut file) = load() else { return };
     let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
     let bpe = Bpe::from_gguf(&gguf).unwrap();
-    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
-
-    let prompt = bpe.encode(STORY_PROMPT);
-    // Positions, not tokens: the last prompt position already produces the
-    // first generated token.
-    let steps = prompt.len() + STORY_TOKENS - 1;
-    let mut transformer = Transformer::new(config, weights, steps);
-    let mut generation = Generation::new(prompt, steps, &[bpe.eos()]);
-    let mut ids = Vec::new();
-    while let Some(step) = generation.step(&mut transformer) {
-        if step.generated {
-            ids.push(step.next);
-        }
-    }
-
     let recorded: Vec<u32> = include_str!("data/smollm2_story.engine.ids")
         .lines()
         .map(|line| line.parse().unwrap())
         .collect();
-    if ids != recorded {
-        let ids: Vec<String> = ids.iter().map(u32::to_string).collect();
-        panic!("generated:\n{}", ids.join("\n"));
+
+    // Stepping through the prompt a token at a time, and prefilling it in
+    // one batch as the chat does.
+    for prefill in [false, true] {
+        let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+        let prompt = bpe.encode(STORY_PROMPT);
+        // Positions, not tokens: the last prompt position already produces
+        // the first generated token.
+        let steps = prompt.len() + STORY_TOKENS - 1;
+        let mut transformer = Transformer::new(config, weights, steps);
+        let mut generation = Generation::new(prompt, steps, &[bpe.eos()]);
+        if prefill {
+            generation.prefill(&mut transformer);
+        }
+        let mut ids = Vec::new();
+        while let Some(step) = generation.step(&mut transformer) {
+            if step.generated {
+                ids.push(step.next);
+            }
+        }
+
+        if ids != recorded {
+            let ids: Vec<String> = ids.iter().map(u32::to_string).collect();
+            panic!("generated (prefill {prefill}):\n{}", ids.join("\n"));
+        }
     }
 }
 
@@ -228,8 +235,9 @@ fn four_workers_compute_the_same_bits_as_one() {
 
 /// Feeding tokens together through `prefill` leaves the model in exactly
 /// the state feeding them one at a time does: the next token's logits are
-/// the same bits. Over 150 tokens, so the batches of 64 and their
-/// boundaries are covered, on one worker and on four.
+/// the same bits, whether the last token runs through `forward` or in the
+/// batch (`prefill_logits`). Over 150 tokens, so the batches of 64 and
+/// their boundaries are covered, on one worker and on four.
 #[test]
 fn prefill_computes_the_same_bits_as_one_token_at_a_time() {
     let Some(mut file) = load() else { return };
@@ -271,6 +279,22 @@ fn prefill_computes_the_same_bits_as_one_token_at_a_time() {
         assert!(
             got == expected,
             "the logits after prefill differ ({} workers)",
+            if workers.is_some() { 4 } else { 1 }
+        );
+
+        let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+        let mut batched = Transformer::new(config, weights, tokens.len());
+        if let Some(workers) = workers {
+            batched.set_workers(workers);
+        }
+        let got: Vec<u32> = batched
+            .prefill_logits(&tokens, 0)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert!(
+            got == expected,
+            "the logits from prefill_logits differ ({} workers)",
             if workers.is_some() { 4 } else { 1 }
         );
     }

@@ -143,10 +143,13 @@ cache dropped before each run. Raspberry Pi OS (Debian 13, kernel 6.18),
    attention 6.1. `make kernel` puts the 4x8 kernel at about 30.7 cycles
    per 4x4 block whatever the shape, token count or core count (floor
    about 25 from its instruction count), which is 86.5 ms of the 107.0:
-   - Fold the prompt's last token into the batch, computing logits only
-     for its row. It goes through `forward` alone today, memory-bound,
-     about 33 ms of the prompt's 174; batched, about 7. Expected about
-     280 tok/s.
+   - The prompt's last token is now in the batch (`prefill_logits`),
+     bit-identical, and the answer phase lost its 33 ms as expected. But
+     the first run's prompt came in at 209.1 tok/s, not about 280: every
+     prompt phase about 40% slower (matmul 107.0 -> 152.4 ms) on the same
+     tile count, while the answer's phases ran at full speed. That looks
+     like a clock cut during the burst; the `arm:` lines before and after
+     the prompt will say.
    - Then find the 20 ms `matmul_batch` spends outside the kernel.
 2. Fan control, then rerun the baseline above for the final side-by-side.
 

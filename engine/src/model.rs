@@ -689,20 +689,29 @@ impl<'a> Transformer<'a> {
         // `run.c` normalises `x` in place; a copy of the input keeps the
         // borrow checker satisfied and changes no arithmetic.
         self.xb.copy_from_slice(&self.x);
-        rmsnorm(&mut self.x, &self.xb, w.rms_final, c.norm_eps);
-        matmul(
-            &mut self.logits,
-            &self.x,
-            &w.classifier,
-            &mut self.mm,
-            Input::New,
-        );
+        self.classify();
 
         let ended = self.mm.now();
         let phases = self.mm.phases();
         phases.total += ended - started;
         phases.calls += 1;
         &self.logits
+    }
+
+    /// The logits for the token after the one whose final residual stream
+    /// is in `xb`: the last RMSNorm, then the classifier. The tail of
+    /// [`Self::forward`] and of [`Self::prefill_logits`], shared so that
+    /// the two compute the same bits.
+    fn classify(&mut self) {
+        let c = self.config;
+        rmsnorm(&mut self.x, &self.xb, self.weights.rms_final, c.norm_eps);
+        matmul(
+            &mut self.logits,
+            &self.x,
+            &self.weights.classifier,
+            &mut self.mm,
+            Input::New,
+        );
     }
 
     /// The most tokens [`Self::prefill`] runs through the model together; a
@@ -728,6 +737,36 @@ impl<'a> Transformer<'a> {
         for (i, batch) in tokens.chunks(Self::MAX_BATCH).enumerate() {
             self.forward_batch(batch, pos + i * Self::MAX_BATCH);
         }
+    }
+
+    /// [`Self::prefill`], then the logits for the token after the last
+    /// one — the same bits as feeding the last through [`Self::forward`].
+    ///
+    /// For a whole prompt: its last token's logits choose the first answer
+    /// token. Through `forward` alone, that token reads every weight for
+    /// itself; in the batch it shares the reads, and only the classifier
+    /// runs for one row.
+    ///
+    /// # Panics
+    ///
+    /// If `tokens` is empty, or as [`Self::prefill`] does.
+    pub fn prefill_logits(&mut self, tokens: &[u32], pos: usize) -> &[f32] {
+        assert!(!tokens.is_empty(), "a token to compute logits for");
+        self.prefill(tokens, pos);
+        self.mm.in_prefill = true;
+        let started = self.mm.now();
+
+        // The last token's residual stream, the last row of the last batch.
+        let dim = self.config.dim;
+        let row = (tokens.len() - 1) % Self::MAX_BATCH;
+        self.xb
+            .copy_from_slice(&self.batch.x[row * dim..(row + 1) * dim]);
+        self.classify();
+
+        let ended = self.mm.now();
+        self.mm.phases().total += ended - started;
+        self.mm.in_prefill = false;
+        &self.logits
     }
 
     /// [`Self::prefill`] for one batch of at most [`Self::MAX_BATCH`].

@@ -157,7 +157,7 @@ pub extern "C" fn kmain() -> ! {
 
     cores::reset_stats();
     let started = timer.now_micros();
-    let ids = chat(&mut transformer, &bpe, &timer);
+    let ids = chat(&mut transformer, &bpe, &timer, &mut mailbox);
     let profile = transformer.profile();
     let rate = cores::Counter.ticks_per_second();
     report_phases("prompt", &profile.prefill, rate);
@@ -209,9 +209,36 @@ fn full_speed(mailbox: &mut Mailbox) {
     }
 }
 
+/// Logs what the ARM is running at `when`: the measured clock, the SoC's
+/// temperature, and the firmware's throttling word (bits 0-3 now, 16-19
+/// since boot: under-voltage, frequency capped, throttled, soft
+/// temperature limit).
+///
+/// The prompt is the run's hardest burst, all four cores in `sdot` at
+/// once, and one run's prompt phases all slowed down together by about
+/// 40% while the answer's ran at full speed: what a clock cut for the
+/// burst would look like.
+fn arm_state(mailbox: &mut Mailbox, when: &str) {
+    let mhz = mailbox
+        .measured_clock_rate_hz(ClockId::Arm)
+        .map_or(0, |hz| hz / 1_000_000);
+    let temp = mailbox.temperature_millicelsius().unwrap_or(0);
+    let throttled = mailbox.throttled().unwrap_or(u32::MAX);
+    logln!(
+        "arm: {when}: {mhz} MHz measured, {}.{} C, throttled {throttled:#x}",
+        temp / 1000,
+        temp % 1000 / 100
+    );
+}
+
 /// Answers [`PROMPT`] greedily, streaming the answer to the terminal as
 /// each token arrives, and returns the answer's tokens.
-fn chat(transformer: &mut Transformer, bpe: &Bpe, timer: &Timer) -> Vec<u32> {
+fn chat(
+    transformer: &mut Transformer,
+    bpe: &Bpe,
+    timer: &Timer,
+    mailbox: &mut Mailbox,
+) -> Vec<u32> {
     let prompt = bpe.encode(PROMPT);
     let prompt_len = prompt.len();
     // Positions, not tokens: the last prompt position already produces the
@@ -223,9 +250,16 @@ fn chat(transformer: &mut Transformer, bpe: &Bpe, timer: &Timer) -> Vec<u32> {
 
     let mut ids = Vec::new();
     let mut piece = Vec::new();
-    let started = timer.now_micros();
-    // The prompt, all but its last token, through the model together.
+    arm_state(mailbox, "before the prompt");
+    let mut started = timer.now_micros();
+    // The whole prompt through the model together; the first step then
+    // returns the answer's first token.
     generation.prefill(transformer);
+    // Read straight after, while the burst's state lasts; its own time is
+    // taken out of the prompt's.
+    let probe = timer.now_micros();
+    arm_state(mailbox, "after the prompt");
+    started += timer.now_micros() - probe;
     // When the first answer token arrived: the prompt's positions before it
     // and the answer's after it are timed separately, since a chat's
     // latency is the one and its speed the other.

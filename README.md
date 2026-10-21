@@ -79,7 +79,7 @@ ones that need model files skip without `make models`). `make test-arm`
 runs the same tests built for 64-bit Arm under `qemu-aarch64`, so the
 NEON code the board runs is checked against the same references (it
 needs `qemu-aarch64` and `rustup target add aarch64-unknown-linux-musl`,
-and takes a few minutes). `make bandwidth`
+and takes about ten minutes). `make bandwidth`
 runs a memory bandwidth measurement on the board instead of the model,
 and `make kernel` times the prompt's matrix multiply kernel alone, in
 cycles per 4-row by 4-token block (about 30 on one core or four, with
@@ -117,6 +117,11 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 - The `phases:` lines split the time inside the model: quantizing
   activations to 8 bits, the weight matrix multiplies, attention, and
   everything else (normalization, RoPE, SwiGLU, residual adds).
+- The whole prompt, its last token included, runs through the model as
+  one batch, and only the last token's row goes through the classifier.
+  The `arm:` lines around it log the measured clock, the temperature and
+  the firmware's throttling word, since the prompt is the run's hardest
+  burst.
 
 What the numbers say:
 

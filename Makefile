@@ -71,12 +71,14 @@ test:
 # emulator, so that the NEON kernels the board runs are checked against
 # the same references; the host's own build runs the scalar ones. Needs
 # qemu-aarch64 and `rustup target add aarch64-unknown-linux-musl`; links
-# with rust-lld, so no cross C toolchain. A few minutes: qemu is slow.
+# with rust-lld, so no cross C toolchain. About ten minutes: qemu is
+# slow. Two tests at a time, since each SmolLM2 test holds its own copy
+# of the 386 MB model, and five at once under qemu ran out of memory.
 ARM_TEST := aarch64-unknown-linux-musl
 test-arm:
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64 \
-	cargo test --release -p rpi-llm-engine --target $(ARM_TEST)
+	cargo test --release -p rpi-llm-engine --target $(ARM_TEST) -- --test-threads=2
 
 # The model files, for the tests and for copying onto the card's models/.
 models: $(addprefix models/,$(MODEL_FILES))

@@ -32,6 +32,9 @@ pub struct Generation {
     pos: usize,
     steps: usize,
     stop: Vec<u32>,
+    /// The first answer token, chosen by [`Self::prefill`] and returned by
+    /// the next [`Self::step`].
+    pending: Option<Step>,
 }
 
 impl Generation {
@@ -52,6 +55,7 @@ impl Generation {
             pos: 0,
             steps,
             stop: stop.to_vec(),
+            pending: None,
         }
     }
 
@@ -60,34 +64,55 @@ impl Generation {
         self.prompt.len()
     }
 
-    /// Runs every prompt token but the last through the model together
-    /// ([`Transformer::prefill`]), instead of one [`Self::step`] each.
+    /// Runs the prompt through the model together
+    /// ([`Transformer::prefill_logits`]), instead of one [`Self::step`]
+    /// each, and chooses the first answer token from its last token's
+    /// logits.
     ///
-    /// The cache ends up holding the same bits either way, so the answer is
-    /// the same; it just arrives sooner. The prompt tokens fed this way are
-    /// not returned as steps: the next `step` feeds the last prompt token
-    /// and returns the first answer token.
+    /// The cache and the logits are the same bits either way, so the answer
+    /// is the same; it just arrives sooner. The prompt tokens fed this way
+    /// are not returned as steps; the next `step` returns the first answer
+    /// token without running the model.
     ///
     /// # Panics
     ///
     /// If called after the first `step`.
     pub fn prefill(&mut self, transformer: &mut Transformer) {
         assert_eq!(self.pos, 0, "prefill comes before the first step");
-        let last = self.prompt.len() - 1;
-        if last > 0 {
-            transformer.prefill(&self.prompt[..last], 0);
+        // Only the positions `steps` allows, as `step` would run them.
+        let n = self.prompt.len().min(self.steps);
+        if n == 0 {
+            return;
         }
-        self.pos = last;
-        self.token = self.prompt[last];
+        if n < self.prompt.len() {
+            // Every position runs a prompt token: no logits are needed.
+            transformer.prefill(&self.prompt[..n], 0);
+            self.pos = n;
+            self.token = self.prompt[n];
+            return;
+        }
+        let logits = transformer.prefill_logits(&self.prompt, 0);
+        self.pos = n - 1;
+        self.token = self.prompt[n - 1];
+        self.pending = self.advance(logits);
     }
 
     /// Runs one position: `None` once `steps` positions have run or the
     /// model has chosen a stop token.
     pub fn step(&mut self, transformer: &mut Transformer) -> Option<Step> {
+        if let Some(step) = self.pending.take() {
+            return Some(step);
+        }
         if self.pos >= self.steps {
             return None;
         }
         let logits = transformer.forward(self.token, self.pos);
+        self.advance(logits)
+    }
+
+    /// Moves past the current position, whose `logits` the model has just
+    /// computed: the next token is the prompt's, or the model's choice.
+    fn advance(&mut self, logits: &[f32]) -> Option<Step> {
         let (next, generated) = match self.prompt.get(self.pos + 1) {
             Some(&forced) => (forced, false),
             None => (argmax(logits), true),
