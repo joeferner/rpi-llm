@@ -27,16 +27,18 @@ answer tokens, greedy), one Pi 5 at 2.4 GHz:
 
 | | Load | Prompt | Answer |
 |---|---|---|---|
-| rpi-llm, bare metal, 4 cores (2026-10-21) | 5.37 s (71.9 MB/s) | 287.7 tok/s | 30.0 tok/s |
+| rpi-llm, bare metal, 4 cores (2026-10-21) | 4.24 s (91.0 MB/s) | 284.4 tok/s | 30.1 tok/s |
 | llama.cpp, Linux, 4 threads (2026-10-20) | 5.05 s (77 MB/s) | 261.3 | 25.2 |
 | llama.cpp, Linux, 1 thread | 5.01 s | 91.4 | 28.8 |
 | rpi-llm, Linux, 4 threads (before batching) | 4.37 s (88 MB/s) | 27.6 | 25.9 |
 
 The Linux rows come from `bench/linux/run.sh` (Raspberry Pi OS, Debian 13,
 kernel 6.18, `performance` governor, page cache dropped, llama.cpp
-`0ce8cd1` with mmap off). The bare-metal load is from a different card
-than Linux's; rpi-hal now runs it in UHS-I SDR104, as Linux does. From
-power-on the board is ready for the prompt in 7.8 s.
+`0ce8cd1` with mmap off). Every row read the same card (bare metal from
+its FAT boot partition, in UHS-I SDR104). Bare metal is ahead on all
+three; from power-on the board is ready for the prompt in 6.75 s. On the
+slower card the board usually boots from, the load is 5.37 s (71.9 MB/s,
+that card's own limit).
 
 ## Build order
 
@@ -47,11 +49,12 @@ power-on the board is ready for the prompt in 7.8 s.
 2. **Rerun the Linux baseline** for the final side-by-side: the `rpi-llm`
    Linux rows predate batching, NEON attention and the 4x8 kernel, and the
    card should be the same one the board reads.
-3. **Faster startup**, after the 5.4 s load: the FNV-1a check of the
-   whole file takes 1.4 s on one core (drop it, or spread it over four),
-   and repacking the weights 0.5 s. SDR104 reads at 73% of its bus;
-   ADMA2 in `rpi-hal` would show whether the word-at-a-time FIFO reads or
-   the card set that.
+3. **Faster startup**, after the 4.24 s load: the FNV-1a check of the
+   whole file takes 1.4 s on one core and repacking the weights 0.5 s,
+   both after the read; on cores 1-3 as each chunk arrives they'd end
+   with it. The load itself reaches 91.0 MB/s against `sd_speed`'s 95.1
+   on this card: read in larger requests than 1 MiB. The demo needs a
+   card as fast as this one (it is the Linux install's).
 4. **Smaller prompt work**, if it's worth it after the above:
    - `matmul_batch` spends about 20 ms of the prompt's 111.7 ms of matrix
      multiplies outside the kernel (`make kernel` puts the kernel at about
@@ -104,8 +107,9 @@ Each item lands in `rpi-hal` as its own PR with its own example, tested on
 the board before this app uses it. This app uses `rpi-hal` by crate name,
 through a local `[patch.crates-io]` path while the work is in progress.
 
-- **ADMA2 for the SD driver**, if SDR104's 73% of its bus turns out to
-  be the FIFO reads rather than the card (build order step 3).
+- **ADMA2 for the SD driver**, not for speed (the word-at-a-time FIFO
+  reads keep up: 95.1 MB/s, 95% of SDR104's bus, on a fast card) but to
+  free the CPU while a load streams in.
 - **Mapping RAM above 4 GiB**, for bigger models on 8 GB and 16 GB boards.
 - **Stretch: PCIe root complex + NVMe driver**, for loading models from the
   SSD (see the stretch goal above).

@@ -60,19 +60,19 @@ the chat request and the answer as it is generated, then how fast each
 part ran:
 
 ```
-models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  71.9 MB/s
-[    5.840] models/smollm2-360m-instruct-q8_0.gguf: 386404992 bytes in 5.37 s, 71.9 MB/s
+models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  91.0 MB/s
+[    4.774] models/smollm2-360m-instruct-q8_0.gguf: 386404992 bytes in 4.24 s, 91.0 MB/s
 ...
 <|im_start|>user
 Write a short story about a robot who learns to paint.<|im_end|>
 <|im_start|>assistant
 Once upon a time, there was a robot named Robo who was very smart ...
-[   14.671] chat: prompt 42 tokens in 0.15 s, 287.7 tok/s
-[   14.674] chat: answer 200 tokens in 6.64 s, 30.0 tok/s
-[   14.679] phases: prompt: 1 calls in 145.9 ms: quantize 8.4, matmul 111.8, attention 6.3, other 19.3
-[   14.688] phases: answer: 199 calls in 6623.5 ms: quantize 115.0, matmul 5924.5, attention 420.5, other 163.5
+[   13.560] chat: prompt 42 tokens in 0.15 s, 284.4 tok/s
+[   13.563] chat: answer 200 tokens in 6.60 s, 30.1 tok/s
+[   13.569] phases: prompt: 1 calls in 147.6 ms: quantize 8.4, matmul 113.6, attention 6.3, other 19.3
+[   13.578] phases: answer: 199 calls in 6585.6 ms: quantize 114.5, matmul 5884.4, attention 421.9, other 164.8
 ...
-[   14.723] reference: all 200 tokens match the host engine
+[   13.613] reference: all 200 tokens match the host engine
 ```
 
 `make test` runs the engine's tests on the development machine (the
@@ -90,23 +90,54 @@ the tokens in L1 or not).
 
 SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 (42 prompt tokens, 200 answer tokens), on one Raspberry Pi 5 (8 GB) at
-2.4 GHz, the Linux rows measured 2026-10-20 and the bare-metal row
-2026-10-21:
+2.4 GHz, reading the model off the same SD card; the Linux rows measured
+2026-10-20 and the bare-metal row 2026-10-21:
 
 | | Load | Prompt | Answer |
 |---|---|---|---|
-| rpi-llm, bare metal, 4 cores | 5.37 s (71.9 MB/s) | 287.7 tok/s | 30.0 tok/s |
+| rpi-llm, bare metal, 4 cores | **4.24 s (91.0 MB/s)** | **284.4 tok/s** | **30.1 tok/s** |
 | rpi-llm, Linux, 4 threads | 4.37 s (88 MB/s) | 27.6 tok/s | 25.9 tok/s |
 | rpi-llm, Linux, 1 thread | 4.42 s | 26.0 tok/s | 22.3 tok/s |
 | llama.cpp, Linux, 4 threads | 5.05 s (77 MB/s) | 261.3 tok/s | 25.2 tok/s |
 | llama.cpp, Linux, 1 thread | 5.01 s | 91.4 tok/s | 28.8 tok/s |
 
+The same three as charts: the load as a time (lower is better), the
+prompt and the answer as rates (higher is better). The `rpi-llm` Linux
+rows are left out of the rate charts: they predate the engine's batching
+and kernels (see below).
+
+```mermaid
+xychart-beta
+    title "Load the 386 MB model off the SD card (s, lower is better)"
+    x-axis ["bare metal", "rpi-llm on Linux", "llama.cpp, 4 threads", "llama.cpp, 1 thread"]
+    y-axis "seconds" 0 --> 6
+    bar [4.24, 4.37, 5.05, 5.01]
+```
+
+```mermaid
+xychart-beta
+    title "Prompt (tok/s, higher is better)"
+    x-axis ["bare metal", "llama.cpp, 4 threads", "llama.cpp, 1 thread"]
+    y-axis "tokens per second" 0 --> 300
+    bar [284.4, 261.3, 91.4]
+```
+
+```mermaid
+xychart-beta
+    title "Answer (tok/s, higher is better)"
+    x-axis ["bare metal", "llama.cpp, 4 threads", "llama.cpp, 1 thread"]
+    y-axis "tokens per second" 0 --> 35
+    bar [30.1, 25.2, 28.8]
+```
+
 - **Load** is the whole 386 MB model read off the SD card into RAM: the
   page cache dropped before each Linux run, and llama.cpp's mmap off so
   that it really reads the file (its time includes repacking the weights
-  for its own kernels). The bare-metal row was read from a different card
-  from the one Linux read, so the two load rates aren't strictly
-  comparable.
+  for its own kernels). Every row read the same card, the bare-metal one
+  from its FAT boot partition (512-byte clusters) and Linux from ext4.
+  On another card, a slower one, the bare-metal load took 5.37 s (71.9
+  MB/s): the card sets the rate, not the driver, which reads both at
+  about 95% of what `rpi-hal`'s `sd_speed` example measures them at.
 - **Prompt** is the prompt's tokens until the first answer token; **answer**
   is the answer's tokens after that.
 - Linux is Raspberry Pi OS (Debian 13, kernel 6.18) with the `performance`
@@ -129,9 +160,11 @@ SmolLM2-360M-Instruct, Q8_0, answering the same chat request greedily
 
 What the numbers say:
 
-- **Generation is at parity, a little ahead.** Every configuration meets
-  the same limit,
-  the memory: a token reads every weight once, and four cores together
+- **Bare metal is ahead on all three.** The load by 3% over the same
+  engine on Linux and 16% over llama.cpp, the prompt by 9% and the
+  answer by 4.5% over llama.cpp's best.
+- **Generation is a little ahead.** Every configuration meets the same
+  limit, the memory: a token reads every weight once, and four cores together
   read at most 13.9 GB/s (one alone reads 14.0), which `make bandwidth`
   measures. Splitting each matrix's rows across the cores in interleaved
   4 KiB chunks rather than contiguous quarters is what gets near that.
@@ -151,14 +184,15 @@ What the numbers say:
   run as eight independent chains rather than four, took it to 241.3.
   Running the prompt's last token in the batch too, rather than through
   the single-token path that reads every weight for it alone, took it to
-  287.7; the matrix multiplies are now three quarters of the prompt's
-  time.
-- **The load is close to Linux's.** rpi-hal's SD driver went from
-  default speed (11.7 MB/s, 32.9 s) to UHS-I SDR104 (71.9 MB/s, 5.37 s):
+  287.7 (284.4 in the run above); the matrix multiplies are now three
+  quarters of the prompt's time.
+- **The load is ahead of Linux's.** rpi-hal's SD driver went from
+  default speed (11.7 MB/s, 32.9 s) to UHS-I SDR104 (91.0 MB/s, 4.24 s):
   the card at 1.8V signalling and 200 MHz with a tuned sampling point,
   as Linux runs it. From power-on, the board is ready for the prompt in
-  7.8 s, a third of that after the load: hashing the file to check it
-  (1.4 s) and repacking the weights (0.5 s).
+  6.75 s, with 1.9 s of that after the load: hashing the file to check it
+  (1.4 s) and repacking the weights (0.5 s), both still on one core
+  after the read rather than alongside it.
 
 To reproduce the Linux rows, on a Pi 5 running Raspberry Pi OS (64-bit)
 with this repository cloned:
