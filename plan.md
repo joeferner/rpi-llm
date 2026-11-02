@@ -86,8 +86,6 @@ that card's own limit).
    `pwm` (RP1 PWM1, `Pwm1Pin::Gpio45`, inverted) would make it quiet at
    idle. Start each speed change at 50% or more: the fan sits at 0 RPM for
    seconds when asked for 25% from a standstill.
-5. **Drop the temporary `[patch.crates-io]` path to rpi-hal** once its next
-   release (with `mem` on bcm2712 and PSCI multicore) is out.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector
 
