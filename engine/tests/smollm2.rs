@@ -30,6 +30,7 @@ mod common;
 
 use common::{Threads, read_model_file};
 use rpi_llm_engine::bpe::Bpe;
+use rpi_llm_engine::chat::{self, Chat};
 use rpi_llm_engine::generate::Generation;
 use rpi_llm_engine::gguf::Gguf;
 use rpi_llm_engine::model::{Transformer, Weights};
@@ -298,4 +299,75 @@ fn prefill_computes_the_same_bits_as_one_token_at_a_time() {
             if workers.is_some() { 4 } else { 1 }
         );
     }
+}
+
+/// A new conversation's first turn is the board's fixed request exactly:
+/// the template around the story request encodes to the prompt file's
+/// tokens, and the reply begins with the recorded answer.
+#[test]
+fn chat_first_turn_is_the_recorded_request() {
+    let Some(mut file) = load() else { return };
+    let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
+    let bpe = Bpe::from_gguf(&gguf).unwrap();
+    let mut chat = Chat::new(chat::SYSTEM);
+    let message = "Write a short story about a robot who learns to paint.";
+    assert_eq!(chat.turn_tokens(&bpe, message), bpe.encode(STORY_PROMPT));
+
+    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+    let mut transformer = Transformer::new(config, weights, 512);
+    let (reply, stats) = chat::collect(&mut chat, &mut transformer, &bpe, message, 30).unwrap();
+    let recorded: Vec<u32> = include_str!("data/smollm2_story.engine.ids")
+        .lines()
+        .take(30)
+        .map(|l| l.parse().unwrap())
+        .collect();
+    assert_eq!(reply, recorded);
+    assert_eq!(stats.stop, chat::Stop::Limit);
+}
+
+/// A second turn, run on the cache the first left, replies exactly as a
+/// fresh model given the whole conversation from position 0 does. The
+/// first reply is cut off at a limit, so its last token reaches the cache
+/// only with the second turn.
+#[test]
+fn chat_second_turn_continues_the_cache() {
+    let Some(mut file) = load() else { return };
+    let gguf = Gguf::parse_repacked(file.bytes_mut()).unwrap();
+    let bpe = Bpe::from_gguf(&gguf).unwrap();
+
+    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+    let mut transformer = Transformer::new(config, weights, 512);
+    let mut chat = Chat::new(chat::SYSTEM);
+    let first = chat.turn_tokens(&bpe, "What is the capital of France?");
+    let (reply1, stats) = chat::collect(
+        &mut chat,
+        &mut transformer,
+        &bpe,
+        "What is the capital of France?",
+        // Short enough to cut the answer off, which is the case to test.
+        4,
+    )
+    .unwrap();
+    assert_eq!(stats.stop, chat::Stop::Limit);
+    let second = chat.turn_tokens(&bpe, "And of Italy?");
+    let (reply2, _) =
+        chat::collect(&mut chat, &mut transformer, &bpe, "And of Italy?", 12).unwrap();
+
+    // The same conversation from scratch: the second turn's tokens start
+    // with the first reply's last token, which the cache didn't hold yet.
+    let mut whole = first;
+    whole.extend(&reply1[..reply1.len() - 1]);
+    whole.extend(&second);
+    let (config, weights) = Weights::from_gguf(&gguf).unwrap();
+    let mut fresh = Transformer::new(config, weights, 512);
+    let mut next = argmax(fresh.prefill_logits(&whole, 0));
+    let mut expected = Vec::new();
+    for pos in whole.len().. {
+        if next == bpe.eos() || expected.len() == 12 {
+            break;
+        }
+        expected.push(next);
+        next = argmax(fresh.forward(next, pos));
+    }
+    assert_eq!(reply2, expected);
 }

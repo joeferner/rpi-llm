@@ -6,10 +6,11 @@ console. See [plan.md](plan.md) for the design, what is still to come,
 and why.
 
 Today it loads [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct)
-(a Q8_0 GGUF file) off the SD card, answers one fixed chat request on all
-four cores, streams the answer to the serial console, and checks it token
-for token against what the same engine produces on a development
-machine. It is a bare-metal Rust program on
+(a Q8_0 GGUF file) off the SD card and chats at the serial console: type
+a message, and the reply streams back as it is generated on all four
+cores. A `benchmark` build first answers one fixed request, timed and
+checked token for token against what the same engine produces on a
+development machine. It is a bare-metal Rust program on
 [rpi-hal](https://crates.io/crates/rpi-hal) and
 [rpi-kickstart](https://crates.io/crates/rpi-kickstart).
 
@@ -56,8 +57,34 @@ make run DEVICE=/dev/ttyUSB0
 
 This builds `target/kernel8.img`, uploads it to the board over the serial
 cable, and boots it. On the same cable it shows the model loading, then
-the chat request and the answer as it is generated, then how fast each
-part ran:
+the chat. Each reply streams as it is generated and ends with how fast it
+came: its length and rate, how fast this turn's prompt went through, and
+how much of the 2048-position context the conversation fills. The
+conversation stays in the model's cache, so a follow-up only costs its
+own message.
+
+```
+models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  91.0 MB/s
+...
+Chat with SmolLM2-360M-Instruct. Type a message and press Enter;
+Ctrl-C stops a reply, /reset starts a new conversation.
+
+> What is the capital of France?
+...the reply...
+[<reply tokens> tok, <reply rate> tok/s, prompt <rate> tok/s, context <used>/2048]
+```
+
+Enter sends; Backspace, Ctrl-U and Ctrl-C edit the line. A reply runs to
+at most 512 tokens, and when the context is full the next message starts
+a new conversation.
+
+```sh
+make benchmark DEVICE=/dev/ttyUSB0
+```
+
+The same with the `benchmark` feature: before the chat, one fixed
+request, answered greedily, timed phase by phase and checked against the
+host engine's answer. The performance numbers below come from it:
 
 ```
 models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  91.0 MB/s
@@ -67,8 +94,8 @@ models/smollm2-360m-instruct-q8_0.gguf: 368.5 / 368.5 MiB [####...####] 100%  91
 Write a short story about a robot who learns to paint.<|im_end|>
 <|im_start|>assistant
 Once upon a time, there was a robot named Robo who was very smart ...
-[   13.560] chat: prompt 42 tokens in 0.15 s, 284.4 tok/s
-[   13.563] chat: answer 200 tokens in 6.60 s, 30.1 tok/s
+[   13.560] benchmark: prompt 42 tokens in 0.15 s, 284.4 tok/s
+[   13.563] benchmark: answer 200 tokens in 6.60 s, 30.1 tok/s
 [   13.569] phases: prompt: 1 calls in 147.6 ms: quantize 8.4, matmul 113.6, attention 6.3, other 19.3
 [   13.578] phases: answer: 199 calls in 6585.6 ms: quantize 114.5, matmul 5884.4, attention 421.9, other 164.8
 ...

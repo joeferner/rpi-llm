@@ -2,7 +2,9 @@
 #
 #   make                          build target/kernel8.img
 #   make run DEVICE=/dev/ttyUSB0  build it, upload it over the UART with
-#                                 rpi-loader, and boot it
+#                                 rpi-loader, and boot it into the chat
+#   make benchmark DEVICE=...     the same with the `benchmark` feature:
+#                                 the timed, checked fixed request first
 #   make test                     the engine's tests, on this machine
 #   make test-arm                 the same, as Arm code under qemu (NEON)
 #   make models                   fetch the model files into models/, for
@@ -32,7 +34,7 @@ MODEL_URL_stories15M.bin := https://huggingface.co/karpathy/tinyllamas/resolve/m
 MODEL_URL_tokenizer.bin := https://raw.githubusercontent.com/karpathy/llama2.c/350e04f/tokenizer.bin
 MODEL_URL_smollm2-360m-instruct-q8_0.gguf := https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF/resolve/main/smollm2-360m-instruct-q8_0.gguf
 
-.PHONY: all build run bandwidth kernel test test-arm models sd-card clean
+.PHONY: all build run benchmark bandwidth kernel test test-arm models sd-card clean
 
 # The host's own target, which `make test` builds the engine for:
 # `.cargo/config.toml` points plain `cargo` at the board.
@@ -46,6 +48,13 @@ build:
 	@echo "built target/$(KERNEL)"
 
 run: build
+	rpi-loader --device $(DEVICE) boot --load-addr $(LOAD_ADDR) target/$(KERNEL)
+
+# The fixed request, timed and checked against the host engine, then the
+# chat (src/benchmark.rs).
+benchmark:
+	cargo build --release --features benchmark
+	cargo objcopy --release --features benchmark -- -O binary target/$(KERNEL)
 	rpi-loader --device $(DEVICE) boot --load-addr $(LOAD_ADDR) target/$(KERNEL)
 
 # The memory bandwidth measurement (examples/bandwidth.rs), on the board.

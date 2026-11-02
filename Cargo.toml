@@ -32,6 +32,12 @@ critical-section = "1.2"
 # Hands the console its sink for `'static`, without a `static mut`.
 static_cell = "2.1"
 
+[features]
+# Runs one fixed chat request before the chat, timed phase by phase and
+# checked token for token against the host engine (src/benchmark.rs):
+# where the README's performance numbers come from. `make benchmark`.
+benchmark = []
+
 # TEMPORARY, until the next rpi-hal and rpi-kickstart releases: rpi-hal
 # 0.10 does not build `rpi_hal::mem` for the Pi 5, which rpi-kickstart's
 # `heap` needs, nor `multicore`, and rpi-kickstart 0.4 has no `bcm2712`

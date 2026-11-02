@@ -42,20 +42,37 @@ that card's own limit).
 
 ## Build order
 
-1. **The chat interface** on the RP1 UART0 (next): line input with basic
-   editing, the answer streamed as it's generated, and a `[200 tok, 30.0
-   tok/s, prompt 288 tok/s]` footer after each reply — the showcase
-   number. Today the program answers one fixed request.
-2. **Rerun the Linux baseline** for the final side-by-side: the `rpi-llm`
+1. **Rerun the Linux baseline** for the final side-by-side: the `rpi-llm`
    Linux rows predate batching, NEON attention and the 4x8 kernel, and the
    card should be the same one the board reads.
-3. **Faster startup**, after the 4.24 s load: the FNV-1a check of the
-   whole file takes 1.4 s on one core and repacking the weights 0.5 s,
-   both after the read; on cores 1-3 as each chunk arrives they'd end
-   with it. The load itself reaches 91.0 MB/s against `sd_speed`'s 95.1
-   on this card: read in larger requests than 1 MiB. The demo needs a
-   card as fast as this one (it is the Linux install's).
-4. **Smaller prompt work**, if it's worth it after the above:
+2. **Faster startup: overlap the hash and the repack with the read.**
+   After the 4.24 s load, the FNV-1a check of the whole file takes 1.4 s
+   on one core and repacking the weights 0.5 s, both after the read, so
+   the prompt is ready 6.75 s after power-on. Done on each chunk while
+   the next one is still coming off the card, they'd end with the read:
+   about 4.9 s.
+   - **In `rpi-hal`: a non-blocking SD read on ADMA2.** ADMA2 is in
+     (`Sd::set_adma`, off by default) and verified both ways on the
+     board, but `read_blocks` still blocks until the transfer ends, so it
+     frees nothing yet. Add a pair of calls: one that issues the command
+     and returns once the controller is moving the data, and one that
+     waits for the end and does the post-transfer cache invalidate —
+     polled, since the Pi 5 has no interrupt controller support. The
+     buffer is borrowed until the wait, so the API has to keep it from
+     being touched or freed in between. Example: `sd_speed` timing how
+     much work a core gets done while a read is in flight.
+   - **In `rpi-llm`'s loader:** double-buffer the read. Start chunk *n+1*,
+     then hash and repack chunk *n* on core 0 while the controller fills
+     the next; the progress line stays as it is. The FNV-1a hash runs at
+     about 270 MB/s and the repack faster, against 91 MB/s off the card,
+     so one core keeps up. This needs `resident-fat` to expose the file's
+     runs of blocks (or a read call that doesn't block) rather than only
+     a blocking `read_at`.
+   - **The last few MB/s:** the load reaches 91.0 MB/s against
+     `sd_speed`'s 95.1 on this card; requests larger than 1 MiB should
+     close most of that. The demo needs a card as fast as this one (it is
+     the Linux install's).
+3. **Smaller prompt work**, if it's worth it after the above:
    - `matmul_batch` spends about 20 ms of the prompt's 111.7 ms of matrix
      multiplies outside the kernel (`make kernel` puts the kernel at about
      30.7 cycles per 4x4 block, 86.5 ms of it).
@@ -63,13 +80,13 @@ that card's own limit).
      the next didn't; the `arm:` lines (clock, temperature, throttling)
      before and after the prompt are there to catch it if it happens
      again. Not heat: the next run ran at 30–33 °C, never throttled.
-5. **Quieter fan**, optional polish. Undriven, the fan runs at full speed,
+4. **Quieter fan**, optional polish. Undriven, the fan runs at full speed,
    and under this load the SoC stays near 33 °C, so it isn't holding
    anything back. Driving it from the SoC temperature with `rpi-hal`'s
    `pwm` (RP1 PWM1, `Pwm1Pin::Gpio45`, inverted) would make it quiet at
    idle. Start each speed change at 50% or more: the fan sits at 0 RPM for
    seconds when asked for 25% from a standstill.
-6. **Drop the temporary `[patch.crates-io]` path to rpi-hal** once its next
+5. **Drop the temporary `[patch.crates-io]` path to rpi-hal** once its next
    release (with `mem` on bcm2712 and PSCI multicore) is out.
 
 ## Stretch goal: models on an NVMe SSD on the PCIe connector
@@ -107,9 +124,10 @@ Each item lands in `rpi-hal` as its own PR with its own example, tested on
 the board before this app uses it. This app uses `rpi-hal` by crate name,
 through a local `[patch.crates-io]` path while the work is in progress.
 
-- **ADMA2 for the SD driver**, not for speed (the word-at-a-time FIFO
-  reads keep up: 95.1 MB/s, 95% of SDR104's bus, on a fast card) but to
-  free the CPU while a load streams in.
-- **Mapping RAM above 4 GiB**, for bigger models on 8 GB and 16 GB boards.
+- **A non-blocking SD read over ADMA2** (build order step 2). ADMA2
+  itself is done (`Sd::set_adma`, off by default, since blocking
+  transfers gain nothing from it: the FIFO keeps up with the bus and the
+  cache maintenance costs about 1%); what's left is a read that starts
+  and returns, so the CPU it frees can be used.
 - **Stretch: PCIe root complex + NVMe driver**, for loading models from the
   SSD (see the stretch goal above).

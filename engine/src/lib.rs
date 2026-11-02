@@ -16,6 +16,7 @@ extern crate alloc;
 
 mod attention;
 pub mod bpe;
+pub mod chat;
 pub mod generate;
 pub mod gguf;
 pub mod llama2;

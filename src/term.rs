@@ -51,6 +51,29 @@ pub fn write_bytes(bytes: &[u8]) {
     });
 }
 
+/// The next byte typed at the terminal, waiting for one.
+///
+/// The lock is taken for each look and released between them, so output
+/// from elsewhere — another core's log line — isn't held up by a wait for
+/// the keyboard.
+pub fn read_byte() -> u8 {
+    loop {
+        if let Some(byte) = try_read_byte() {
+            return byte;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// A byte typed at the terminal, if one is waiting.
+pub fn try_read_byte() -> Option<u8> {
+    critical_section::with(|cs| {
+        UART.borrow_ref(cs)
+            .as_ref()
+            .and_then(|uart| uart.try_read_byte())
+    })
+}
+
 /// Runs `f` on the terminal's UART with the lock held, so that several
 /// writes go out together. Does nothing before [`init`].
 fn with(f: impl FnOnce(&mut Uart)) {

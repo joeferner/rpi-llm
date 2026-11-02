@@ -164,7 +164,8 @@ static PUBLISHED: CacheAligned<AtomicU64> = CacheAligned(AtomicU64::new(0));
 /// Jobs run since the statistics were last reset.
 static JOBS_RUN: CacheAligned<AtomicU64> = CacheAligned(AtomicU64::new(0));
 
-/// Zeroes the statistics.
+/// Zeroes the statistics. Only the benchmark reads them.
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
 pub fn reset_stats() {
     for s in &STATS {
         s.0.work.store(0, Ordering::Relaxed);
@@ -175,6 +176,7 @@ pub fn reset_stats() {
 
 /// Where the cores' time went since [`reset_stats`]: per core, the
 /// microseconds working and waiting (see [`CoreStats`]), and the jobs run.
+#[cfg_attr(not(feature = "benchmark"), allow(dead_code))]
 pub fn stats() -> ([(u64, u64); 4], u64) {
     let per_us = tick_rate() / 1_000_000;
     let mut out = [(0, 0); 4];
