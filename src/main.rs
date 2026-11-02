@@ -6,7 +6,10 @@
 //!
 //! SmolLM2-360M-Instruct, a Q8_0 GGUF file, is read off the SD card into
 //! RAM with a progress line while it loads, checked against the host's
-//! checksum, and parsed. Then the chat: type a message at the terminal and
+//! checksum, and parsed. If an NVMe SSD on the external PCIe connector has
+//! the same file on its first FAT volume, it is read from there too, timed
+//! and checked the same way, and that copy is the one used ([`ssd`]), so
+//! the two loads can be compared. Then the chat: type a message at the terminal and
 //! the reply streams back, greedily chosen on all four cores, with how
 //! fast it came after it ([`chat`]).
 //!
@@ -21,6 +24,7 @@ mod benchmark;
 mod chat;
 mod cores;
 mod load;
+mod ssd;
 mod term;
 
 use core::fmt::Write;
@@ -102,12 +106,29 @@ pub extern "C" fn kmain() -> ! {
         Err(e) => fail(format_args!("storage: {e:?}")),
     };
 
+    logln!("loading from the SD card");
     let (mut file, elapsed) = match load::load(&mut volume, MODEL, &timer) {
         Ok(loaded) => loaded,
         Err(e) => fail(format_args!("{MODEL}: {e:?}")),
     };
     report_load(MODEL, file.bytes().len(), elapsed);
     report_checksum(MODEL, file.bytes(), &timer);
+
+    // The same file off the SSD, if there is one, for the comparison. Its
+    // copy replaces the card's only once it has loaded in full; anything
+    // short of that leaves the card's in place.
+    if let Some(mut ssd_volume) = ssd::mount(peripherals.PCIE1, &timer) {
+        logln!("loading from the SSD");
+        match load::load(&mut ssd_volume, MODEL, &timer) {
+            Ok((ssd_file, elapsed)) => {
+                report_load(MODEL, ssd_file.bytes().len(), elapsed);
+                report_checksum(MODEL, ssd_file.bytes(), &timer);
+                file = ssd_file;
+            }
+            Err(e) => logln!("ssd: {MODEL}: {e:?}"),
+        }
+        ssd::shut_down(ssd_volume, &timer);
+    }
 
     let started = timer.now_micros();
     let gguf = match Gguf::parse_repacked(file.bytes_mut()) {
