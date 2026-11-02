@@ -2,8 +2,8 @@
 
 rpi-hal baremetal LLM chat engine: a small language model running on a
 Raspberry Pi 5 with no operating system, chatting over the serial
-console. See [plan.md](plan.md) for the design, what is still to come,
-and why.
+console. What is still to come is in the
+[issues](https://github.com/joeferner/rpi-llm/issues).
 
 Today it loads [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct)
 (a Q8_0 GGUF file) off the SD card and chats at the serial console: type
